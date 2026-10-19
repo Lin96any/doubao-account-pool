@@ -1,6 +1,8 @@
 import path from "node:path";
 import Database from "better-sqlite3";
 import { app } from "electron";
+import { diagnoseRequest } from "./request-diagnostics.js";
+import { mergeWatermarkStatus, watermarkScope, type WatermarkProviderEvent } from "./watermark-state.js";
 import type {
   Account,
   AccountCreateInput,
@@ -14,7 +16,9 @@ import type {
   AppSettingsUpdateInput,
   DoubaoModel,
   OperationLog,
-  OperationLogCreateInput
+  OperationLogCreateInput,
+  RequestStats,
+  WatermarkStatus
 } from "./types.js";
 
 const now = () => new Date().toISOString();
@@ -73,6 +77,11 @@ export class AppDatabase {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS service_state (
+        scope TEXT PRIMARY KEY,
+        value TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS api_requests (
@@ -384,6 +393,7 @@ export class AppDatabase {
       INSERT INTO settings (key, value, updated_at)
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      WHERE settings.value <> excluded.value
     `);
 
     for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof AppSettings>) {
@@ -392,6 +402,33 @@ export class AppDatabase {
     }
 
     return this.getSettings();
+  }
+
+  getWatermarkStatus(settings = this.getSettings()): WatermarkStatus {
+    const empty: WatermarkStatus = {
+      configured: Boolean(settings.watermarkApiToken.trim()), usage: null, checkedAt: null, usageUpdatedAt: null, error: null
+    };
+    if (!empty.configured) return empty;
+    const row = this.db.prepare("SELECT value FROM service_state WHERE scope = ?").get(watermarkScope(settings)) as { value: string } | undefined;
+    if (!row) return empty;
+    try { return { ...empty, ...JSON.parse(row.value) }; } catch { return empty; }
+  }
+
+  recordWatermarkResponse(settings: AppSettings, event: WatermarkProviderEvent) {
+    const state = mergeWatermarkStatus(this.getWatermarkStatus(settings), event);
+    this.db.prepare("INSERT INTO service_state(scope, value) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET value = excluded.value")
+      .run(watermarkScope(settings), JSON.stringify(state));
+  }
+
+  getRequestStats(startIso: string, endIso: string): RequestStats {
+    const row = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status = 'failed' AND finished_at >= ? AND finished_at < ? THEN 1 ELSE 0 END), 0) AS todayFailed,
+        COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+        COALESCE(SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END), 0) AS queued
+      FROM api_requests
+    `).get(startIso, endIso) as Omit<RequestStats, "todaySuccess">;
+    return { ...row, todaySuccess: this.countSuccessfulVideosBetween(startIso, endIso) };
   }
 
   listApiRequests(limit = 100): ApiRequest[] {
@@ -407,6 +444,7 @@ export class AppDatabase {
         accounts.partition AS accountPartition,
         api_requests.status,
         api_requests.message,
+        api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
         api_requests.remove_watermark AS removeWatermark,
@@ -455,6 +493,7 @@ export class AppDatabase {
         accounts.partition AS accountPartition,
         api_requests.status,
         api_requests.message,
+        api_requests.error_json AS errorJson,
         api_requests.prompt,
         api_requests.reference_image_path AS referenceImagePath,
         api_requests.remove_watermark AS removeWatermark,
@@ -628,6 +667,7 @@ export class AppDatabase {
         raw_video_url = ?,
         clean_video_url = ?,
         output_video_path = ?,
+        error_json = ?,
         updated_at = ?,
         finished_at = COALESCE(?, finished_at)
       WHERE request_id = ?
@@ -638,6 +678,7 @@ export class AppDatabase {
       input.rawVideoUrl ?? existing.rawVideoUrl,
       input.cleanVideoUrl ?? existing.cleanVideoUrl,
       input.outputVideoPath ?? existing.outputVideoPath,
+      status === "failed" ? JSON.stringify(input.error || existing.error || diagnoseRequest(input.message || existing.message)) : null,
       now(),
       finishedAt,
       input.requestId
@@ -784,6 +825,7 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "quota_cost", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("api_requests", "quota_refunded", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("api_requests", "finished_at", "TEXT");
+    this.addColumnIfMissing("api_requests", "error_json", "TEXT");
   }
 
   private cleanInvalidSuccessfulResults() {
@@ -857,12 +899,20 @@ function normalizeApiRequest(row: unknown): ApiRequest {
   const request = row as ApiRequest & {
     removeWatermark: number | boolean;
     quotaRefunded: number | boolean;
+    errorJson: string | null;
   };
+  let error = null;
+  if (request.status === "failed") {
+    try { error = request.errorJson ? JSON.parse(request.errorJson) : diagnoseRequest(request.message); }
+    catch { error = diagnoseRequest(request.message); }
+  }
+  const { errorJson: _errorJson, ...values } = request;
   return {
-    ...request,
+    ...values,
     aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
     removeWatermark: Boolean(request.removeWatermark),
-    quotaRefunded: Boolean(request.quotaRefunded)
+    quotaRefunded: Boolean(request.quotaRefunded),
+    error
   };
 }
 

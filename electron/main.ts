@@ -18,7 +18,8 @@ import type {
   DoubaoModel,
   GenerateRequestBody
 } from "./types.js";
-import { resolveCleanVideoUrl } from "./watermark.js";
+import { resolveCleanVideoUrl, WatermarkError } from "./watermark.js";
+import type { WatermarkProviderObserver } from "./watermark-state.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,6 +28,11 @@ let mainWindow: BrowserWindow | null = null;
 let db: AppDatabase;
 let executor: DoubaoExecutor;
 let apiServer: LocalApiServer;
+
+const observeWatermarkResponse: WatermarkProviderObserver = (settings, event) => {
+  db.recordWatermarkResponse(settings, event);
+  notifyDataChanged();
+};
 
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 
@@ -131,6 +137,11 @@ class LocalApiServer {
 
       if (request.method === "GET" && requestUrl.pathname === "/api/accounts") {
         sendJson(response, 200, { accounts: this.database.listAccounts() });
+        return;
+      }
+
+      if (request.method === "GET" && requestUrl.pathname === "/api/watermark/status") {
+        sendJson(response, 200, this.database.getWatermarkStatus());
         return;
       }
 
@@ -282,7 +293,7 @@ class LocalApiServer {
           return;
         }
         try {
-          const cleanVideoUrl = await resolveCleanVideoUrl(settings, sourceUrl);
+          const cleanVideoUrl = await resolveCleanVideoUrl(settings, sourceUrl, undefined, { onProviderResponse: observeWatermarkResponse });
           recordOperation(null, null, "独立去水印解析", "success", "已验证真实 MP4 地址", sourceUrl);
           sendJson(response, 200, {
             status: "success",
@@ -301,6 +312,7 @@ class LocalApiServer {
           );
           sendJson(response, 422, {
             status: "failed",
+            error: error instanceof WatermarkError ? error.info : null,
             message: error instanceof Error ? error.message : "去水印解析失败",
             cleanVideoUrl: null,
             outputVideoPath: null
@@ -454,8 +466,11 @@ function registerIpc() {
 
   ipcMain.handle("settings:get", () => db.getSettings());
   ipcMain.handle("settings:update", async (_event, input: AppSettingsUpdateInput) => {
+    const previous = db.getSettings();
     const settings = db.updateSettings(input);
-    await apiServer.applySettings(settings);
+    if (previous.apiPort !== settings.apiPort || previous.apiServiceEnabled !== settings.apiServiceEnabled || previous.apiKey !== settings.apiKey) {
+      await apiServer.applySettings(settings);
+    }
     recordOperation(null, null, "保存配置", "success", "配置已保存并应用");
     return settings;
   });
@@ -464,6 +479,14 @@ function registerIpc() {
   ipcMain.handle("api-server:restart", async () => apiServer.applySettings(db.getSettings()));
 
   ipcMain.handle("api-requests:list", (_event, limit?: number) => db.listApiRequests(limit || 100));
+  ipcMain.handle("watermark:status", () => db.getWatermarkStatus());
+  ipcMain.handle("api-requests:stats", (_event, startIso: string, endIso: string) => db.getRequestStats(startIso, endIso));
+  ipcMain.handle("api-requests:recover", (_event, requestId: string) => {
+    const request = db.getApiRequest(requestId);
+    if (!request?.accountId || request.status === "running" || request.status === "accepted") throw new Error("任务当前无法恢复结果");
+    executor.enqueueRecovery(requestId);
+    return true;
+  });
   ipcMain.handle("api-requests:stop", (_event, requestId: string) => executor.stop(requestId));
   ipcMain.handle("api-requests:today-success-count", (_event, startIso: string, endIso: string) =>
     db.countSuccessfulVideosBetween(startIso, endIso)
@@ -714,7 +737,7 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
     log.initialize();
     db = new AppDatabase();
-    executor = new DoubaoExecutor(db, notifyDataChanged);
+    executor = new DoubaoExecutor(db, notifyDataChanged, observeWatermarkResponse);
     apiServer = new LocalApiServer(db, executor);
     registerIpc();
     await apiServer.applySettings(db.getSettings());

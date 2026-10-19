@@ -27,8 +27,11 @@ const api = {
     todaySuccessCount: (startIso: string, endIso: string) =>
       ipcRenderer.invoke("api-requests:today-success-count", startIso, endIso),
     stop: (requestId: string) => ipcRenderer.invoke("api-requests:stop", requestId),
-    clear: () => ipcRenderer.invoke("api-requests:clear")
+    clear: () => ipcRenderer.invoke("api-requests:clear"),
+    stats: (startIso: string, endIso: string) => ipcRenderer.invoke("api-requests:stats", startIso, endIso),
+    recover: (requestId: string) => ipcRenderer.invoke("api-requests:recover", requestId)
   },
+  watermark: { status: () => ipcRenderer.invoke("watermark:status") },
   operationLogs: {
     list: (limit?: number) => ipcRenderer.invoke("operation-logs:list", limit),
     clear: () => ipcRenderer.invoke("operation-logs:clear")

@@ -1,4 +1,14 @@
 import type { AppSettings } from "./types.js";
+import type { RequestErrorInfo } from "./types.js";
+import { classifyWatermarkFailure } from "./request-diagnostics.js";
+import { extractWatermarkUsage, type WatermarkProviderObserver } from "./watermark-state.js";
+
+export class WatermarkError extends Error {
+  constructor(readonly info: RequestErrorInfo, message = `${info.title}：${info.detail}`) {
+    super(message);
+    this.name = "WatermarkError";
+  }
+}
 
 const VIDEO_URL_KEYS = [
   "cleanVideoUrl",
@@ -30,6 +40,7 @@ type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>
 
 export interface WatermarkResolveOptions {
   maxAttempts?: number;
+  onProviderResponse?: WatermarkProviderObserver;
 }
 
 export function getWatermarkRetryDelays(
@@ -86,7 +97,7 @@ export async function resolveCleanVideoUrl(
   options: WatermarkResolveOptions = {}
 ) {
   if (!settings.watermarkApiToken.trim()) {
-    throw new Error("未配置去水印 Token，无法返回可用视频");
+    throw new WatermarkError(classifyWatermarkFailure("未配置去水印 Token，无法返回可用视频"));
   }
 
   let lastError: unknown;
@@ -97,7 +108,7 @@ export async function resolveCleanVideoUrl(
     if (delayMs) await wait(delayMs);
 
     try {
-      return await resolveCleanVideoUrlOnce(settings, shareUrl);
+      return await resolveCleanVideoUrlOnce(settings, shareUrl, options.onProviderResponse);
     } catch (error) {
       lastError = error;
       if (!isRetryableWatermarkError(error) || attempt === retryDelays.length - 1) {
@@ -117,41 +128,49 @@ export async function resolveCleanVideoUrl(
   throw lastError;
 }
 
-async function resolveCleanVideoUrlOnce(settings: AppSettings, shareUrl: string) {
-  const apiUrl = `${settings.watermarkApiUrl}?url=${encodeURIComponent(shareUrl)}`;
-  const upstream = await fetch(apiUrl, {
-    headers: { Authorization: settings.watermarkApiToken },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-  });
-  const text = await upstream.text();
-  if (!upstream.ok) {
-    throw new Error(`去水印接口失败：HTTP ${upstream.status} ${text.slice(0, 160)}`);
-  }
-
-  const payload = parseJson(text);
-  const payloadText = typeof payload === "string" ? payload : JSON.stringify(payload);
-  if (UNSUPPORTED_RE.test(payloadText)) {
-    throw new Error("去水印接口返回：平台暂不支持");
-  }
-
-  if (payload && typeof payload === "object" && "code" in payload) {
-    const code = Number((payload as Record<string, unknown>).code);
-    if (Number.isFinite(code) && code !== 0 && code !== 200) {
-      const message = String((payload as Record<string, unknown>).message || "解析失败");
-      throw new Error(`去水印接口失败：${message}`);
+async function resolveCleanVideoUrlOnce(settings: AppSettings, shareUrl: string, observer?: WatermarkProviderObserver) {
+  let usage = null as ReturnType<typeof extractWatermarkUsage>;
+  const notify = (error: RequestErrorInfo | null) => {
+    try {
+      observer?.(settings, { checkedAt: new Date().toISOString(), usage, error });
+    } catch {
+      // A statistics write must not turn a valid provider result into failure.
     }
+  };
+  try {
+    const apiUrl = new URL(settings.watermarkApiUrl);
+    apiUrl.searchParams.set("url", shareUrl);
+    const upstream = await fetch(apiUrl, {
+      headers: { Authorization: settings.watermarkApiToken },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+    const text = await upstream.text();
+    const payload = parseJson(text);
+    usage = extractWatermarkUsage(payload);
+    const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : null;
+    const providerCode = record?.code === undefined ? null : Number(record.code);
+    const rawMessage = String(record?.message || record?.msg || (typeof payload === "string" ? payload : "解析失败"));
+    const message = rawMessage.replaceAll(settings.watermarkApiToken, "[Token 已隐藏]").replace(/nologo_[A-Za-z0-9_-]+/g, "[Token 已隐藏]").slice(0, 800);
+    if (!upstream.ok || providerCode !== null && Number.isFinite(providerCode) && providerCode !== 0 && providerCode !== 200) {
+      throw new WatermarkError(classifyWatermarkFailure(message, upstream.ok ? providerCode || undefined : upstream.status));
+    }
+    if (UNSUPPORTED_RE.test(message) || UNSUPPORTED_RE.test(typeof payload === "string" ? payload : JSON.stringify(payload))) {
+      throw new WatermarkError(classifyWatermarkFailure("平台暂不支持"));
+    }
+    const cleanVideoUrl = extractVideoUrlFromPayload(payload);
+    if (!cleanVideoUrl) throw new WatermarkError(classifyWatermarkFailure("去水印接口没有返回 MP4 视频地址"));
+    await verifyPlayableVideoUrl(cleanVideoUrl);
+    notify(null);
+    return cleanVideoUrl;
+  } catch (error) {
+    const typed = error instanceof WatermarkError ? error : new WatermarkError(classifyWatermarkFailure(errorMessage(error)));
+    notify(typed.info);
+    throw typed;
   }
-
-  const cleanVideoUrl = extractVideoUrlFromPayload(payload);
-  if (!cleanVideoUrl) {
-    throw new Error("去水印接口没有返回 MP4 视频地址");
-  }
-
-  await verifyPlayableVideoUrl(cleanVideoUrl);
-  return cleanVideoUrl;
 }
 
 export function isRetryableWatermarkError(error: unknown) {
+  if (error instanceof WatermarkError) return error.info.retryable;
   const message = error instanceof Error ? error.message : String(error);
   if (UNSUPPORTED_RE.test(message)) return false;
   return /未找到资源|资源未就绪|处理中|稍后重试|解析失败|获取失败|没有返回 MP4|HTTP (?:404|408|409|425|429|5\d\d)|无法访问|不是可播放视频|fetch failed|network|timeout|aborted/i.test(message);

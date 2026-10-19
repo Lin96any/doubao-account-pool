@@ -33,8 +33,11 @@ import {
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
-import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoAspectRatio, DoubaoModel } from "./types.js";
-import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
+import { confirmationDelayRemaining, hasFormalGenerationAcknowledgement, hasNewFormalGenerationAcknowledgement, shouldAttemptShareRecovery } from "./generation-policy.js";
+import { diagnoseRequest } from "./request-diagnostics.js";
+import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoAspectRatio, DoubaoModel, RequestErrorInfo } from "./types.js";
+import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource, WatermarkError } from "./watermark.js";
+import type { WatermarkProviderObserver } from "./watermark-state.js";
 
 type DataChangedCallback = () => void;
 type QueueItem = {
@@ -91,8 +94,6 @@ const SHARE_PANEL_WAIT_MS = 3500;
 const PAGE_SHARE_CAPTURE_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
-const DIRECT_GENERATION_FOLLOW_UP = "请直接提交视频生成，不要改写、分析或扩写提示词。";
-const DIRECT_GENERATION_SHORT_FOLLOW_UP = "直接生成";
 const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成";
 const PREFERRED_CONVERSATION_RETRY_MS = 75000;
 const RECENT_CONVERSATION_FALLBACK_LIMIT = 10;
@@ -105,7 +106,8 @@ export class DoubaoExecutor {
 
   constructor(
     private readonly database: AppDatabase,
-    private readonly onDataChanged: DataChangedCallback
+    private readonly onDataChanged: DataChangedCallback,
+    private readonly onWatermarkResponse?: WatermarkProviderObserver
   ) {
     this.scheduler = new AccountTaskScheduler(
       () => this.database.getSettings().maxConcurrentAccounts,
@@ -189,23 +191,23 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
-      win = this.createExecutionWindow(account, settings, requestId);
-      await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
-      await wait(2500);
-      await dismissDoubaoDesktopDownloadPrompt(win);
-
-      if (await looksLoggedOut(win)) {
-        throw new Error("豆包账号未登录，无法恢复视频结果");
-      }
-
-      const recovery = await findGeneratedConversationAndCopyShare(
-        win,
-        request.prompt,
-        request.doubaoThreadUrl,
-        async (message) => {
+      const savedShare = request.error?.stage === "watermark"
+        ? extractDoubaoWatermarkShareUrl(request.doubaoThreadUrl)
+        : null;
+      let recovery: ShareRecoveryResult;
+      if (savedShare) {
+        await this.updateProgress({ requestId, status: "running", message: "正在重试已保存视频分享地址的去水印解析" });
+        recovery = { shareUrl: savedShare, candidateCount: 0, promptMatchCount: 0, generatedMatchCount: 1, pendingMatchCount: 0, failureMessage: null, shareFailureReason: null };
+      } else {
+        win = this.createExecutionWindow(account, settings, requestId);
+        await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
+        await wait(2500);
+        await dismissDoubaoDesktopDownloadPrompt(win);
+        if (await looksLoggedOut(win)) throw new Error("豆包账号未登录，无法恢复视频结果");
+        recovery = await findGeneratedConversationAndCopyShare(win, request.prompt, request.doubaoThreadUrl, async (message) => {
           await this.updateProgress({ requestId, status: "running", message });
-        }
-      );
+        });
+      }
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
           const shouldRefund = isQuotaNotChargedFailure(recovery.failureMessage)
@@ -266,7 +268,7 @@ export class DoubaoExecutor {
         return;
       }
       const message = errorMessage(error);
-      await this.failRequest(request, `恢复结果失败：${message}`, false);
+      await this.failRequest(request, `恢复结果失败：${message}`, false, error instanceof WatermarkError ? error.info : undefined);
       this.database.updateAccount({
         id: account.id,
         currentStatus: /未登录|登录/.test(message) ? "login_required" : "idle"
@@ -512,7 +514,7 @@ export class DoubaoExecutor {
       if (shouldRefundQuota) {
         this.database.refundApiRequestQuota(requestId);
       }
-      await this.failRequest(request, errorMessage(error), shouldRefundQuota);
+      await this.failRequest(request, errorMessage(error), shouldRefundQuota, error instanceof WatermarkError ? error.info : undefined);
       this.database.updateAccount({
         id: account.id,
         currentStatus: keepWindowOpen ? "login_required" : "idle"
@@ -587,11 +589,13 @@ export class DoubaoExecutor {
             status: "running",
             message: `去水印第 ${retry.failedAttempt} 次未拿到可播放 MP4，已耗时 ${elapsedSeconds} 秒；${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
           });
-        }, { maxAttempts });
+        }, { maxAttempts, onProviderResponse: this.onWatermarkResponse });
         return { url, elapsedMs: Date.now() - startedAt, retryCount };
       } catch (error) {
         const elapsedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1000));
-        throw new Error(`${errorMessage(error)}（去水印已耗时 ${elapsedSeconds} 秒，已重试 ${retryCount} 次）`);
+        const message = `${errorMessage(error)}（去水印已耗时 ${elapsedSeconds} 秒，已重试 ${retryCount} 次）`;
+        if (error instanceof WatermarkError) throw new WatermarkError(error.info, message);
+        throw new Error(message);
       }
     })();
   }
@@ -604,7 +608,8 @@ export class DoubaoExecutor {
     await this.updateProgress({
       requestId,
       status: "running",
-      message: "分享链接已确认包含视频资源，正在请求去水印服务"
+      message: "已取得当前视频分享地址，正在请求去水印服务",
+      doubaoThreadUrl: shareUrl
     });
 
     try {
@@ -615,16 +620,18 @@ export class DoubaoExecutor {
       );
       return { shareUrl, cleanVideo };
     } catch (error) {
+      if (error instanceof WatermarkError) throw error;
       throw new Error(`分享链接已确认包含视频资源，但去水印服务未识别：${errorMessage(error)}`);
     }
   }
 
-  private async failRequest(request: ApiRequest, message: string, refunded: boolean) {
+  private async failRequest(request: ApiRequest, message: string, refunded: boolean, error?: RequestErrorInfo) {
     const suffix = refunded ? "，已退回预扣额度" : "";
     return this.updateProgress({
       requestId: request.requestId,
       status: "failed",
-      message: `${message}${suffix}`
+      message: `${message}${suffix}`,
+      error: error || diagnoseRequest(message)
     });
   }
 
@@ -1541,8 +1548,7 @@ async function submitPromptAndWait(
   win: BrowserWindow,
   model: DoubaoModel,
   prompt: string,
-  onProgress: (message: string) => Promise<void> | void = () => undefined,
-  suggestionFollowUpCount = 0
+  onProgress: (message: string) => Promise<void> | void = () => undefined
 ): Promise<"confirmed"> {
   const baselineText = await getRawPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
@@ -1605,44 +1611,9 @@ async function submitPromptAndWait(
       if (isDoubaoCongestionReply(result.responseMessage)) {
         throw new DoubaoCongestionError(result.responseMessage);
       }
-      if (isDoubaoGenerationPending(result.responseMessage)) {
-        await onProgress("豆包已确认视频任务，当前正在生成或渲染，继续等待结果");
-        return "confirmed";
-      }
-      if (isDoubaoPromptSuggestion(result.responseMessage)) {
-        if (suggestionFollowUpCount >= 3) {
-          throw new DoubaoPageFailureError(
-            `豆包连续返回提示词建议，已尝试明确生成指令但仍未确认视频生成：${result.responseMessage}`,
-            true
-          );
-        }
-        // Doubao now commonly presents a short action reply with a visible
-        // “确认生成” action. Use that exact action first; only fall back to
-        // the longer direct-generation wording when the first response does
-        // not start the video task.
-        const followUp = suggestionFollowUpCount === 0
-          ? DIRECT_GENERATION_CONFIRM_FOLLOW_UP
-          : suggestionFollowUpCount === 1
-            ? DIRECT_GENERATION_FOLLOW_UP
-            : DIRECT_GENERATION_SHORT_FOLLOW_UP;
-        await onProgress(suggestionFollowUpCount === 0
-          ? `豆包先返回了提示词建议，优先回复“${followUp}”并继续提交`
-          : suggestionFollowUpCount === 1
-            ? `豆包未按“确认生成”启动任务，正在回复“${followUp}”并继续提交`
-            : `豆包仍未执行视频生成，正在发送备用指令“${followUp}”`);
-        await fillPrompt(win, followUp);
-        return submitPromptAndWait(win, model, followUp, onProgress, suggestionFollowUpCount + 1);
-      }
-      throw new DoubaoPageFailureError(
-        `豆包没有确认视频生成；页面最新回复：${result.responseMessage}`,
-        true
-      );
     }
-    if (result.sentEvidence) {
-      throw new DoubaoPageFailureError(
-        "豆包已收到消息，但没有确认已启动视频生成；为避免误判成功和重复提交，本次已停止等待",
-        true
-      );
+    if (result.sentEvidence || result.responseMessage || result.confirmationClicked) {
+      return awaitGenerationStart(win, model, baselineText, prompt, result, onProgress);
     }
   }
 
@@ -1651,6 +1622,77 @@ async function submitPromptAndWait(
   throw new Error(
     `没有看到豆包提交确认文案：本次使用 ${modelLabel} 生成；已尝试 ${tried.join("、") || "无可用发送动作"}；${formatComposerDiagnostics(diagnostics)}`
   );
+}
+
+async function awaitGenerationStart(
+  win: BrowserWindow,
+  model: DoubaoModel,
+  baselineText: string,
+  prompt: string,
+  initial: Awaited<ReturnType<typeof waitForSubmissionStarted>>,
+  onProgress: (message: string) => Promise<void> | void
+): Promise<"confirmed"> {
+  let state = initial;
+  let stableSince = Date.now();
+  let lastConfirmationAt = 0;
+  let lastReply = state.responseMessage || "";
+  let confirmations = 0;
+  let observedConfirmations = state.confirmationCount;
+  let lastProgressAt = 0;
+  const deadline = Date.now() + 360000;
+  while (Date.now() < deadline) {
+    if (state.confirmed || state.pending) {
+      await onProgress("已确认视频任务启动，开始计算视频生成等待时间");
+      return "confirmed";
+    }
+    if (state.failureMessage) throw new DoubaoPageFailureError(`豆包返回失败：${state.failureMessage}`, isQuotaNotChargedFailure(state.failureMessage));
+    if (isDoubaoCongestionReply(state.responseMessage)) throw new DoubaoCongestionError(state.responseMessage || "豆包繁忙");
+    const now = Date.now();
+    const reply = state.responseMessage || "";
+    if (reply !== lastReply || state.responding) {
+      stableSince = now;
+      lastReply = reply;
+    }
+    if (state.confirmationCount > observedConfirmations) {
+      confirmations += state.confirmationCount - observedConfirmations;
+      observedConfirmations = state.confirmationCount;
+      lastConfirmationAt = now;
+      stableSince = now;
+      await onProgress("检测到对话中新增确认生成指令，继续等待任务启动");
+    }
+    const remaining = confirmationDelayRemaining({ now, stableSince, lastConfirmationAt, confirmationCount: confirmations, accepted: false, responding: state.responding, hasDraft: state.hasDraft });
+    if (remaining === 0) {
+      // Inspect again immediately before writing so manual input and late
+      // acceptance observed during the delay cannot trigger a duplicate send.
+      const checked = await waitForSubmissionStarted(win, model, baselineText, prompt, 1);
+      if (checked.confirmed || checked.pending || checked.responding || checked.hasDraft || checked.confirmationCount > observedConfirmations) {
+        state = checked;
+        continue;
+      }
+      await fillPrompt(win, DIRECT_GENERATION_CONFIRM_FOLLOW_UP);
+      const composer = await inspectComposer(win, DIRECT_GENERATION_CONFIRM_FOLLOW_UP);
+      if (!composer.promptPresent) throw new Error("未能填入确认生成指令，已停止自动补发");
+      const sendPoint = await findComposerSendButtonPoint(win);
+      if (sendPoint) await sendMouseClick(win, sendPoint.x, sendPoint.y);
+      else await sendKeyboard(win, "Enter");
+      confirmations += 1;
+      lastConfirmationAt = Date.now();
+      stableSince = lastConfirmationAt;
+      observedConfirmations += 1;
+      await onProgress(`尚未确认视频启动，已补发“确认生成”，第 ${Math.min(confirmations, 2)}/2 次`);
+    } else if (now - lastProgressAt > 15000) {
+      lastProgressAt = now;
+      await onProgress(state.responding ? "豆包正在回复，等待回复结束后确认视频任务" : remaining === null
+        ? "尚未确认视频启动，等待本次确认回复"
+        : `尚未确认视频启动，${Math.ceil(remaining / 1000)} 秒后补发“确认生成”`);
+    }
+    if (confirmations >= 2 && !state.responding && !state.hasDraft && now - Math.max(lastConfirmationAt, stableSince) >= 120000) break;
+    state = await waitForSubmissionStarted(win, model, baselineText, prompt, 3000);
+  }
+  if (state.responding || state.hasDraft) {
+    throw new DoubaoGenerationPendingError("尚未确认视频启动，页面仍在回复或存在手动输入；已暂停自动补发");
+  }
+  throw new DoubaoPageFailureError(`已等待并补发确认指令，但尚未确认视频启动；页面最新回复：${state.responseMessage || "未取得新的回复"}`, true);
 }
 
 async function sendKeyboard(
@@ -1917,7 +1959,7 @@ async function sendMouseMove(win: BrowserWindow, x: number, y: number) {
   await wait(80);
 }
 
-async function waitForSubmissionStarted(
+export async function waitForSubmissionStarted(
   win: BrowserWindow,
   model: DoubaoModel,
   baselineText: string,
@@ -1931,7 +1973,10 @@ async function waitForSubmissionStarted(
   let confirmationClicked = false;
   let confirmationLabel: string | null = null;
   let safetyConfirmationClicked = false;
-  while (Date.now() - startedAt < timeoutMs) {
+  let firstInspection = true;
+  let lastActivity = { responding: false, hasDraft: false, confirmationCount: 0 };
+  while (firstInspection || Date.now() - startedAt < timeoutMs) {
+    firstInspection = false;
     if (!safetyConfirmationClicked) {
       try {
         const safetyPoint = await findDoubaoSafetyConfirmationPoint(win);
@@ -1965,6 +2010,9 @@ async function waitForSubmissionStarted(
       failureMessage: string | null;
       responseMessage: string | null;
       pageTextExcerpt: string;
+      responding: boolean;
+      hasDraft: boolean;
+      confirmationCount: number;
     }>(win, `
       (() => {
         const modelLabel = ${JSON.stringify(modelLabel)};
@@ -1977,6 +2025,8 @@ async function waitForSubmissionStarted(
         const hasNewPromptOccurrence = ${hasNewPromptOccurrence.toString()};
         const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
         const hasStrongSubmissionEvidence = ${hasStrongSubmissionEvidence.toString()};
+        const hasFormalGenerationAcknowledgement = ${hasFormalGenerationAcknowledgement.toString()};
+        const hasNewFormalGenerationAcknowledgement = ${hasNewFormalGenerationAcknowledgement.toString()};
         const isFormalDoubaoConversationUrl = ${isFormalDoubaoConversationUrl.toString()};
         const safetyConfirmationClicked = ${JSON.stringify(safetyConfirmationClicked)};
         const pageText = (document.body?.innerText || "").trim();
@@ -1992,14 +2042,6 @@ async function waitForSubmissionStarted(
           ? rawResponseMessage
           : null;
         const normalizedResponseMessage = (rawResponseMessage || "").replace(/\\s+/g, " ").replace(/\\*+/g, "").trim();
-        const pendingResponse = Boolean(
-          normalizedResponseMessage
-          && !extractDoubaoFailureMessage(normalizedResponseMessage)
-          && !/你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(normalizedResponseMessage)
-          && (/正在为您生成一段|视频生成中|视频生成已提交|已提交视频生成任务|已提交生成任务|生成任务已提交|正在渲染|等待(?:视频)?(?:生成|渲染)(?:完成|结果)/.test(normalizedResponseMessage)
-            || (/本次使用\\s+Seedance\\s+2\\.0\\s+(?:Mini|Fast)\\s+生成/.test(normalizedResponseMessage)
-              && /预计等待\\s*\\d+\\s*分钟|视频生成好后|本次生成将消耗每日免费额度/.test(normalizedResponseMessage)))
-        );
         const visible = (el) => {
           const rect = el.getBoundingClientRect();
           const style = getComputedStyle(el);
@@ -2019,7 +2061,24 @@ async function waitForSubmissionStarted(
         const promptStillInComposer = Boolean(promptSignature && normalizedEditorText.includes(promptSignature));
         const composerCleared = !editor || normalizedEditorText.length === 0 || !promptStillInComposer;
         const pageChanged = pageText !== baselineText;
-        const confirmationTextAdded = hasNewDoubaoSubmissionConfirmation(pageText, baselineText, modelLabel);
+        const confirmationTextAdded = hasNewFormalGenerationAcknowledgement(pageText, baselineText, modelLabel);
+        const pendingResponse = Array.from(document.querySelectorAll(
+          '[data-testid*="video"], [data-testid*="creation"], [data-testid*="task"], [class*="video-task"], [class*="video_task"], [class*="creation-block"], [class*="creation_block"], [class*="block-video"]'
+        )).some((element) => {
+          const text = (element.innerText || "").trim();
+          return visible(element) && !element.closest('pre, code') && text.length < 400
+            && /视频生成中|视频生成已提交|已提交视频生成任务|正在生成视频/.test(text)
+            && hasNewTextOccurrence(pageText, baselineText, text);
+        });
+        const responding = Array.from(document.querySelectorAll('button, [role="button"]')).some((element) =>
+          visible(element) && /停止回答|停止回复|stop(?:[-_ ]?(?:response|generating|generation))?/i.test(
+            [element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid')].filter(Boolean).join(' ')
+          )
+        );
+        const confirmationCount = Math.max(0,
+          (pageText.match(/^\\s*确认生成\\s*$/gm) || []).length
+          - (baselineText.match(/^\\s*确认生成\\s*$/gm) || []).length
+        );
         const promptMessageAdded = hasNewPromptOccurrence(pageText, baselineText, prompt);
         const sentEvidence = !newFailureMessage && hasStrongSubmissionEvidence({
           confirmationTextAdded,
@@ -2036,10 +2095,15 @@ async function waitForSubmissionStarted(
           sentEvidence,
           failureMessage: newFailureMessage,
           responseMessage,
+          responding,
+          hasDraft: normalizedEditorText.length > 0,
+          confirmationCount,
           pageTextExcerpt: pageText.slice(-500)
         };
       })()
     `);
+
+    lastActivity = { responding: state.responding, hasDraft: state.hasDraft, confirmationCount: state.confirmationCount };
 
     if (state.failureMessage) {
       return {
@@ -2050,7 +2114,8 @@ async function waitForSubmissionStarted(
         responseMessage: null,
         confirmationClicked,
         confirmationLabel,
-        safetyConfirmationClicked
+        safetyConfirmationClicked,
+        ...lastActivity
       };
     }
     if (state.confirmed || state.pending) {
@@ -2059,16 +2124,15 @@ async function waitForSubmissionStarted(
         pending: state.pending,
         sentEvidence: true,
         failureMessage: null,
-        responseMessage: null,
+        responseMessage: state.responseMessage,
         confirmationClicked,
         confirmationLabel,
-        safetyConfirmationClicked
+        safetyConfirmationClicked,
+        ...lastActivity
       };
     }
     sentEvidenceSeen ||= state.sentEvidence;
-    if (!confirmationClicked) {
-      latestResponseMessage = state.responseMessage || latestResponseMessage;
-    }
+    latestResponseMessage = state.responseMessage || latestResponseMessage;
     await wait(1000);
   }
 
@@ -2077,10 +2141,11 @@ async function waitForSubmissionStarted(
     pending: false,
     sentEvidence: sentEvidenceSeen,
     failureMessage: null,
-    responseMessage: confirmationClicked ? null : latestResponseMessage,
+    responseMessage: latestResponseMessage,
     confirmationClicked,
     confirmationLabel,
-    safetyConfirmationClicked
+    safetyConfirmationClicked,
+    ...lastActivity
   };
 }
 
@@ -2123,6 +2188,7 @@ async function waitForGenerationResult(
   let shareFailureReason: string | null = null;
   let historyFallbackAttempted = false;
   let generatedRecoveryAttempted = false;
+  let lastShareRecoveryAt = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
@@ -2161,7 +2227,7 @@ async function waitForGenerationResult(
       now: Date.now()
     });
 
-    if (generated) {
+    if (generated || generatedAt > 0) {
       if (!generatedAt) {
         generatedAt = Date.now();
         await onProgress("视频已生成，正在进入分享模式并复制链接");
@@ -2176,6 +2242,7 @@ async function waitForGenerationResult(
 
       if (!generatedRecoveryAttempted) {
         generatedRecoveryAttempted = true;
+        lastShareRecoveryAt = Date.now();
         await onProgress("当前分享页尚未同步视频，正在回到本次豆包会话自动恢复结果");
         const originalUrl = win.webContents.getURL();
         const recovery = await findGeneratedConversationAndCopyShare(
@@ -2195,8 +2262,12 @@ async function waitForGenerationResult(
         }
       }
 
-      if (Date.now() - generatedAt > 120000) {
-        return { shareUrl: null, directVideoUrl, shareFailureReason };
+      if (shouldAttemptShareRecovery({ generatedAt, lastRecoveryAt: lastShareRecoveryAt, now: Date.now() })) {
+        lastShareRecoveryAt = Date.now();
+        await onProgress("视频已生成，分享资源仍在同步，正在恢复本次对话结果");
+        const recovery = await findGeneratedConversationAndCopyShare(win, prompt, preferredConversationUrl || extractDoubaoConversationUrl(win.webContents.getURL()), onProgress);
+        if (recovery.shareUrl) return { shareUrl: recovery.shareUrl, directVideoUrl };
+        shareFailureReason = recovery.shareFailureReason || shareFailureReason;
       }
     }
 
@@ -2215,7 +2286,8 @@ async function waitForGenerationResult(
         return { shareUrl: recovery.shareUrl, directVideoUrl };
       }
       if (recovery.generatedMatchCount > 0) {
-        return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
+        generatedAt = Date.now();
+        shareFailureReason = recovery.shareFailureReason;
       }
       if (originalUrl) {
         await loadUrl(win, originalUrl);
@@ -2235,6 +2307,10 @@ async function waitForGenerationResult(
   }
 
   if (generatedAt) {
+    await onProgress("视频已生成，正在最后恢复本次分享结果");
+    const recovery = await findGeneratedConversationAndCopyShare(win, prompt, preferredConversationUrl || extractDoubaoConversationUrl(win.webContents.getURL()), onProgress);
+    if (recovery.shareUrl) return { shareUrl: recovery.shareUrl, directVideoUrl };
+    shareFailureReason = recovery.shareFailureReason || shareFailureReason;
     return { shareUrl: null, directVideoUrl, shareFailureReason };
   }
   await onProgress("当前执行窗口等待超时，正在最后检查该账号最近对话");

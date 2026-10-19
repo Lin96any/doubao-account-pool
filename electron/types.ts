@@ -4,6 +4,37 @@ export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type DoubaoAspectRatio = "9:16" | "16:9";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
 export type OperationLogStatus = "info" | "success" | "failed";
+export type FailureStage = "account" | "submission" | "generation" | "sharing" | "watermark" | "output" | "unknown";
+
+export interface RequestErrorInfo {
+  stage: FailureStage;
+  code: string;
+  title: string;
+  detail: string;
+  suggestion: string;
+  retryable: boolean;
+}
+
+export interface WatermarkUsage {
+  totalLimit: number | null;
+  usedCount: number | null;
+  remainingCount: number | null;
+}
+
+export interface WatermarkStatus {
+  configured: boolean;
+  usage: WatermarkUsage | null;
+  checkedAt: string | null;
+  usageUpdatedAt: string | null;
+  error: RequestErrorInfo | null;
+}
+
+export interface RequestStats {
+  todaySuccess: number;
+  todayFailed: number;
+  running: number;
+  queued: number;
+}
 
 export interface Account {
   id: number;
@@ -81,6 +112,7 @@ export interface ApiRequest {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+  error: RequestErrorInfo | null;
 }
 
 export interface ApiRequestCreateInput {
@@ -106,6 +138,7 @@ export interface ApiRequestUpdateInput {
   rawVideoUrl?: string | null;
   cleanVideoUrl?: string | null;
   outputVideoPath?: string | null;
+  error?: RequestErrorInfo | null;
 }
 
 export interface OperationLog {

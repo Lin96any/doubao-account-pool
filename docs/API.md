@@ -3,7 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
-- 当前接口版本：`0.1.72`
+- 当前接口版本：`0.1.73`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。
@@ -102,6 +102,27 @@ Authorization: Bearer <api-key>
 
 ## 单独解析视频结果
 
+### 查询最近的去水印用量
+
+```http
+GET /api/watermark/status
+Authorization: Bearer <api-key>
+```
+
+只读取本机缓存，不额外调用解析服务。`usage` 来自当前接口/Token 最近一次解析响应的 `data.usage`；没有数据时为 `null`。`usageUpdatedAt` 是余额同步时间，`checkedAt` 是最近一次解析检查时间，两者可能不同。更换 Token 后不沿用其它 Token 的余额。
+
+```json
+{
+  "configured": true,
+  "usage": { "totalLimit": 1000, "usedCount": 532, "remainingCount": 468 },
+  "usageUpdatedAt": "2026-10-19T09:00:00.000Z",
+  "checkedAt": "2026-10-19T09:00:00.000Z",
+  "error": null
+}
+```
+
+### 解析已有分享地址
+
 ```http
 POST /api/watermark/parse
 Authorization: Bearer <api-key>
@@ -115,6 +136,30 @@ Content-Type: application/json
 成功时返回经过验证的 `cleanVideoUrl`；失败时返回 HTTP 422 和 `status: "failed"`。
 
 去水印服务存在短暂的资源准备延迟。程序会先验证返回地址确实是可播放 MP4，未就绪时使用短间隔重试；重试状态会按任务顺序异步通知回调，不会阻塞视频结果解析。
+
+## 失败原因
+
+任务查询、回调和独立解析失败响应增加 `error`，原有 `status`、`message` 和视频字段保持兼容：
+
+```json
+{
+  "status": "failed",
+  "message": "去水印次数已耗尽",
+  "error": {
+    "stage": "watermark",
+    "code": "quota_exhausted",
+    "title": "去水印次数已耗尽",
+    "detail": "API Token调用次数已耗尽",
+    "suggestion": "补充去水印次数后恢复结果，无需重新生成视频。",
+    "retryable": false
+  },
+  "cleanVideoUrl": null
+}
+```
+
+`stage` 包括 `account`、`submission`、`generation`、`sharing`、`watermark`、`output` 和 `unknown`。去水印分类包括 `quota_exhausted`、`token_missing`、`token_invalid`、`token_disabled`、`access_denied`、`rate_limited`、`resource_pending`、`network_error`、`unsupported_platform` 和 `invalid_video`。仅明确返回次数不足时才使用 `quota_exhausted`；不明确的 HTTP 403 使用 `access_denied`。
+
+`retryable` 表示当前故障是否适合自动短暂重试，不表示视频要重新生成。已有视频的去水印次数不足时，应先补充额度，再调用原任务的 `retry-result`。
 
 ## 成功语义
 

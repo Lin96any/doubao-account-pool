@@ -5,7 +5,9 @@ import type {
   ApiServerStatus,
   AppSettings,
   AppSettingsUpdateInput,
-  OperationLog
+  OperationLog,
+  RequestStats,
+  WatermarkStatus
 } from "../electron/types";
 
 declare global {
@@ -36,7 +38,10 @@ declare global {
         todaySuccessCount: (startIso: string, endIso: string) => Promise<number>;
         stop: (requestId: string) => Promise<{ request: ApiRequest; stopped: boolean; refunded: boolean }>;
         clear: () => Promise<boolean>;
+        stats: (startIso: string, endIso: string) => Promise<RequestStats>;
+        recover: (requestId: string) => Promise<boolean>;
       };
+      watermark: { status: () => Promise<WatermarkStatus> };
       operationLogs: {
         list: (limit?: number) => Promise<OperationLog[]>;
         clear: () => Promise<boolean>;
