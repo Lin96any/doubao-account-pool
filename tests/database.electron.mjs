@@ -7,6 +7,7 @@ import Database from 'better-sqlite3'
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'doubao-isolated-db-'))
 app.setPath('userData', profile)
+app.on('window-all-closed', () => {})
 app.whenReady().then(async () => {
   app.dock?.hide()
   let exitCode = 0
@@ -18,9 +19,18 @@ app.whenReady().then(async () => {
     model TEXT NOT NULL, account_id INTEGER, status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`)
+  legacy.exec(`CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, partition TEXT NOT NULL UNIQUE,
+    login_status TEXT NOT NULL DEFAULT 'logged_in', daily_quota_limit INTEGER NOT NULL DEFAULT 10,
+    quota_remaining INTEGER NOT NULL DEFAULT 4, quota_used_today INTEGER NOT NULL DEFAULT 6,
+    last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  ); INSERT INTO accounts(name,partition,created_at,updated_at) VALUES ('legacy','persist:doubao_account_001','2026-10-19T00:00:00.000Z','2026-10-19T00:00:00.000Z');`)
   legacy.close()
   const { AppDatabase } = await import('../dist-electron/database.js')
   const database = new AppDatabase()
+  assert.equal(database.getAccount(1).quotaRemaining, 4)
+  assert.equal(database.getAccount(1).quotaUsedToday, 6)
+  assert.ok(database.getAccount(1).quotaDate)
   const settings = database.updateSettings({ apiServiceEnabled: false, executorEnabled: false, watermarkApiToken: 'fixture-A' })
   assert.equal(database.getWatermarkStatus().usage, null)
   database.recordWatermarkResponse(settings, { checkedAt: new Date().toISOString(), usage: { totalLimit: 100, usedCount: 12, remainingCount: 88 }, error: null })
@@ -69,6 +79,27 @@ app.whenReady().then(async () => {
   assert.equal(manualInput.hasDraft, true)
   assert.equal(manualInput.responding, true)
   win.destroy()
+  const { submitPromptAndWait } = await import('../dist-electron/executor.js')
+  const windows = [0, 1, 2].map(() => new BrowserWindow({ show: false, width: 900, height: 700,
+    webPreferences: { sandbox: true, backgroundThrottling: false, partition: 'persist:parallel-test' } }))
+  const prompts = ['same original prompt', 'different original prompt', 'same original prompt']
+  const html = prompt => `<textarea style="width:700px;height:80px">${prompt}</textarea><div id="reply"></div><script>
+    document.querySelector('textarea').focus();
+    document.addEventListener('keydown', event => { if(event.key === 'Enter') { window.sent = document.querySelector('textarea').value; document.querySelector('textarea').value = ''; } });
+  </script>`
+  await Promise.all(windows.map((window, index) => window.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html(prompts[index])))))
+  const submissions = windows.map((window, index) => submitPromptAndWait(window, 'seedance_2_0_mini', prompts[index]))
+  let sent = []
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    sent = await Promise.all(windows.map(window => window.webContents.executeJavaScript('window.sent || null')))
+    if (sent.every(Boolean)) break
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  assert.deepEqual(sent, prompts, 'All three windows must receive their own send before any acknowledgement')
+  await Promise.all(windows.map(window => window.webContents.executeJavaScript(`document.getElementById('reply').innerText = '本次使用 Seedance 2.0 Mini 生成，预计等待 10 分钟。视频生成好后，我会主动发送给你。'`)))
+  assert.deepEqual(await Promise.all(submissions), ['confirmed', 'confirmed', 'confirmed'])
+  windows.forEach(window => window.destroy())
   console.log('ISOLATED_DATABASE_OK')
 } catch (error) {
   console.error(error)

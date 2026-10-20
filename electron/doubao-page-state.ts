@@ -399,6 +399,11 @@ export function isDoubaoCongestionReply(value: string | null | undefined) {
   return /这会儿有点热闹|需要一点时间处理这个任务|当前请求较多|服务繁忙|系统繁忙|稍后再试/.test(text);
 }
 
+export function isDoubaoConcurrencyLimitReply(value: string | null | undefined) {
+  const text = (value || "").replace(/\s+/g, "");
+  return /(?:同时|并发|进行中|生成中|任务数).{0,24}(?:上限|过多|已满|限制)|(?:已有|还有).{0,16}任务.{0,16}(?:完成后|结束后).{0,12}(?:再试|生成|提交)/.test(text);
+}
+
 export function hasNewDoubaoSubmissionConfirmation(
   currentText: string,
   baselineText: string,

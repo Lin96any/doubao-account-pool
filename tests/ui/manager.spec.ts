@@ -6,12 +6,13 @@ async function installFixture(page: Page) {
     const accounts = [10, 8, 6, 3, 0].map((remaining, index) => ({
       id: index + 1, name: `账号 ${String(index + 1).padStart(3, '0')}`, remark: index === 0 ? '主号' : index === 2 ? '动画制作' : '',
       partition: `persist:doubao_account_${String(index + 1).padStart(3, '0')}`, loginStatus: 'logged_in', currentStatus: index === 2 ? 'busy' : 'idle',
-      dailyQuotaLimit: 10, quotaRemaining: remaining, quotaUsedToday: 10 - remaining, lastUsedAt: now, createdAt: now, updatedAt: now
+      dailyQuotaLimit: 10, quotaRemaining: remaining, quotaUsedToday: 10 - remaining, lastUsedAt: now, createdAt: now, updatedAt: now,
+      quotaDate: '2026-10-20', nextQuotaResetAt: '2026-10-20T16:00:00.000Z', runningTaskCount: index === 2 ? 2 : 0, queuedTaskCount: index === 2 ? 1 : 0, maxConcurrentTasks: 3
     }));
     let settings: any = {
       apiServiceEnabled: true, apiPort: 17888, apiKey: 'fixture-key', executorEnabled: true, showExecutorWindow: false, autoCloseExecutorWindow: true,
       doubaoChatUrl: 'https://www.doubao.com/chat', defaultModel: 'seedance_2_0_mini', dailyQuotaLimit: 10, miniCost: 2, fastCost: 3,
-      dailyResetTime: '00:00', generationTimeoutSeconds: 900, maxConcurrentAccounts: 5, retryCount: 1, autoRemoveWatermark: true,
+      dailyResetTime: '00:00', generationTimeoutSeconds: 900, maxConcurrentAccounts: 5, maxConcurrentTasksPerAccount: 3, retryCount: 1, autoRemoveWatermark: true,
       watermarkApiUrl: 'https://example.invalid/parse', watermarkApiToken: 'fixture-only', outputDir: ''
     };
     const base = { model: 'seedance_2_0_mini', aspectRatio: '16:9', source: 'infinite-canvas', referenceImagePath: null, removeWatermark: true, callbackUrl: null,
@@ -36,7 +37,7 @@ async function installFixture(page: Page) {
       accounts: { list: async () => structuredClone(accounts), detectAll: async () => structuredClone(accounts), detectLogin: async () => accounts[0], open: async () => {}, create: async () => accounts[0],
         update: async (input: any) => Object.assign(accounts.find(a => a.id === input.id)!, input), resetQuota: async () => accounts[0], resetAllQuotas: async () => accounts, relogin: async () => true, delete: async () => true },
       settings: { get: async () => ({ ...settings }), update: async (input: any) => { settings = { ...settings, ...input }; fixture.saved++; return { ...settings }; } },
-      apiServer: { status: async () => ({ version: '0.1.73', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
+      apiServer: { status: async () => ({ version: '0.1.74', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
       watermark: { status: async () => ({ configured: true, usage: unknown ? null : { remainingCount: depleted ? 0 : 468, usedCount: depleted ? 1000 : 532, totalLimit: 1000 },
         checkedAt: unknown ? null : now, usageUpdatedAt: unknown ? null : now, error: depleted ? requests[1].error : null }) },
       apiRequests: { list: async () => structuredClone(requests), todaySuccessCount: async () => 8, stats: async () => ({ todaySuccess: 8, todayFailed: 2, running: 1, queued: 0 }), clear: async () => true,
@@ -60,6 +61,15 @@ test('shows compact separate balances, correct per-account capacity and current 
   await expect(page.locator('.balance-row').nth(1).locator('.balance-value')).toContainText('468');
   await expect(page.locator('.capacity')).toHaveText('Mini 13 次/Fast 8 次');
   await expect(page.getByText('等待启动确认', { exact: true })).toBeVisible();
+  await expect(page.locator('.account-task-count').nth(2)).toContainText('执行 2/3');
+  await expect(page.locator('.account-task-count').nth(2)).toContainText('排队 1');
+  await expect(page.locator('.balance-row').first()).toContainText('下次 10/21 00:00');
+  const used = page.getByRole('progressbar', { name: '账号已用额度', exact: true });
+  await expect(used.first()).toHaveAttribute('aria-valuenow', '0');
+  await expect(used.first().locator('span')).toHaveAttribute('style', 'width: 0%;');
+  await expect(used.last()).toHaveAttribute('aria-valuenow', '10');
+  await expect(used.last().locator('span')).toHaveAttribute('style', 'width: 100%;');
+  expect(await used.first().locator('span').evaluate(el => getComputedStyle(el).backgroundColor)).toBe(await used.last().locator('span').evaluate(el => getComputedStyle(el).backgroundColor));
   await expect(page.locator('.service-balances')).toHaveCSS('border-radius', '0px');
   await page.screenshot({ path: 'test-results/accounts-desktop.png', fullPage: true });
   expect(errors).toEqual([]);
@@ -84,6 +94,9 @@ test('preserves unsaved token edits across automatic refresh and saves without A
   await page.goto('/');
   await page.getByRole('button', { name: '配置管理' }).click();
   const token = page.getByLabel('接口 Token');
+  await expect(page.getByLabel('单账号并发上限')).toHaveValue('3');
+  await expect(page.getByLabel('总任务并发上限')).toHaveValue('5');
+  await expect(page.getByLabel('每日重置时间（北京时间）')).toHaveAttribute('readonly', '');
   await token.fill('new-fixture-value');
   await page.evaluate(() => (window as any).__fixture.listeners.forEach((listener: () => void) => listener()));
   await page.waitForTimeout(100);

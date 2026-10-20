@@ -3,6 +3,7 @@ export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
 export type DoubaoAspectRatio = "9:16" | "16:9";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
+export type ExecutionPhase = "queued" | "submitting" | "generating" | "sharing" | "watermark" | "output" | "paused" | "finished";
 export type OperationLogStatus = "info" | "success" | "failed";
 export type FailureStage = "account" | "submission" | "generation" | "sharing" | "watermark" | "output" | "unknown";
 
@@ -46,6 +47,11 @@ export interface Account {
   dailyQuotaLimit: number;
   quotaRemaining: number;
   quotaUsedToday: number;
+  quotaDate: string;
+  nextQuotaResetAt: string;
+  runningTaskCount: number;
+  queuedTaskCount: number;
+  maxConcurrentTasks: number;
   lastUsedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -80,6 +86,7 @@ export interface AppSettings {
   dailyResetTime: string;
   generationTimeoutSeconds: number;
   maxConcurrentAccounts: number;
+  maxConcurrentTasksPerAccount: number;
   retryCount: number;
   autoRemoveWatermark: boolean;
   watermarkApiUrl: string;
@@ -105,6 +112,12 @@ export interface ApiRequest {
   removeWatermark: boolean;
   callbackUrl: string | null;
   doubaoThreadUrl: string | null;
+  sourceConversationUrl: string | null;
+  executionPhase: ExecutionPhase;
+  quotaDay: string | null;
+  quotaCost: number;
+  quotaReserved: boolean;
+  generationAcceptedAt: string | null;
   rawVideoUrl: string | null;
   cleanVideoUrl: string | null;
   outputVideoPath: string | null;
@@ -128,6 +141,9 @@ export interface ApiRequestCreateInput {
   removeWatermark?: boolean;
   callbackUrl?: string | null;
   quotaCost?: number;
+  quotaDay?: string | null;
+  quotaReserved?: boolean;
+  executionPhase?: ExecutionPhase;
 }
 
 export interface ApiRequestUpdateInput {
@@ -135,6 +151,8 @@ export interface ApiRequestUpdateInput {
   status?: ApiRequestStatus;
   message?: string;
   doubaoThreadUrl?: string | null;
+  sourceConversationUrl?: string | null;
+  executionPhase?: ExecutionPhase;
   rawVideoUrl?: string | null;
   cleanVideoUrl?: string | null;
   outputVideoPath?: string | null;
@@ -173,6 +191,7 @@ export interface ApiServerStatus {
 }
 
 export interface GenerateRequestBody {
+  accountId?: number | string;
   model?: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | string | null;
   prompt: string;

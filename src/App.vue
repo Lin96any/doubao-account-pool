@@ -74,7 +74,8 @@ const settingsForm = reactive<AppSettings>({
   fastCost: 3,
   dailyResetTime: "00:00",
   generationTimeoutSeconds: 900,
-  maxConcurrentAccounts: 4,
+  maxConcurrentAccounts: 5,
+  maxConcurrentTasksPerAccount: 3,
   retryCount: 1,
   autoRemoveWatermark: true,
   watermarkApiUrl: "https://nologo.code24.top/api/water-mask/parse",
@@ -324,14 +325,18 @@ async function deleteAccount(account: Account) {
 }
 
 async function resetQuota(account: Account) {
+  try {
   await window.doubaoManager.accounts.resetQuota(account.id);
   await refresh();
+  } catch (error) { notice.value = error instanceof Error ? error.message : "无法重置额度"; }
 }
 
 async function resetAllQuotas() {
   if (!window.confirm("重置所有账号今日额度？")) return;
+  try {
   await window.doubaoManager.accounts.resetAllQuotas();
   await refresh();
+  } catch (error) { notice.value = error instanceof Error ? error.message : "无法重置额度"; }
 }
 
 function openAccountSettings(account: Account) {
@@ -371,6 +376,7 @@ async function saveSettings() {
     fastCost: Number(settingsForm.fastCost),
     generationTimeoutSeconds: Number(settingsForm.generationTimeoutSeconds),
     maxConcurrentAccounts: Number(settingsForm.maxConcurrentAccounts),
+    maxConcurrentTasksPerAccount: Number(settingsForm.maxConcurrentTasksPerAccount),
     retryCount: Number(settingsForm.retryCount)
   });
   Object.assign(settingsForm, saved);
@@ -391,7 +397,12 @@ function accountTask(account: Account) {
 }
 
 function canRecoverRequest(item: ApiRequest) {
-  return item.status === "failed" && Boolean(item.accountId);
+  return (item.status === "failed" || item.status === "accepted" && item.executionPhase === "paused") && Boolean(item.accountId);
+}
+
+function nextResetLabel() {
+  const value = accounts.value[0]?.nextQuotaResetAt;
+  return value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }) : "00:00";
 }
 
 async function recoverRequest(item: ApiRequest) {
@@ -543,7 +554,7 @@ function isLoginRequired(account: Account) {
 }
 
 function isAccountAvailable(account: Account) {
-  return account.loginStatus === "logged_in" && account.currentStatus === "idle" && !isQuotaExhausted(account);
+  return account.loginStatus === "logged_in" && !isLoginRequired(account) && (account.runningTaskCount || 0) < (account.maxConcurrentTasks || 3) && !isQuotaExhausted(account);
 }
 
 function accountStatusLabel(account: Account) {
@@ -664,7 +675,7 @@ onBeforeUnmount(() => {
       <div class="section-title">
         <div>
           <h2>账号管理</h2>
-          <p>{{ accountOverview.total }} 个账号 · {{ accountOverview.loggedIn }} 个已登录 · {{ accountOverview.available }} 个空闲可用</p>
+          <p>{{ accountOverview.total }} 个账号 · {{ accountOverview.loggedIn }} 个已登录 · {{ accountOverview.available }} 个可用</p>
         </div>
         <div class="activity-summary"><span>执行中 <strong>{{ requestStats.running }}</strong></span><span>今日完成 <strong class="text-success">{{ todayGeneratedCount }}</strong></span><span>今日失败 <strong>{{ requestStats.todayFailed }}</strong></span></div>
       </div>
@@ -672,10 +683,10 @@ onBeforeUnmount(() => {
       <div class="service-balances" aria-label="生成额度与去水印次数">
         <div class="balance-row">
           <span class="balance-label"><Users :size="15" />豆包今日额度<Info :size="13" title="本地调度额度，执行中的任务已预扣；不是豆包官方余额" /></span>
-          <strong class="balance-value">{{ accountQuotaSummary.remaining }}<span>/ {{ accountQuotaSummary.total }} 点</span></strong>
-          <div class="balance-track"><span :style="{ width: `${100 - accountQuotaSummary.usedPercent}%` }"></span></div>
+          <strong class="balance-value">{{ accountQuotaSummary.remaining }}<span>/ {{ accountQuotaSummary.total }} 点剩余</span></strong>
+          <div class="balance-meter"><div class="quota-scale"><span>0</span><span>已用 {{ accountQuotaSummary.used }}</span><span>{{ accountQuotaSummary.total }}</span></div><div class="balance-track" role="progressbar" aria-label="账号池已用额度" :aria-valuenow="accountQuotaSummary.used" :aria-valuemax="accountQuotaSummary.total" aria-valuemin="0"><span :style="{ width: `${accountQuotaSummary.usedPercent}%` }"></span></div></div>
           <span class="capacity">Mini <strong>{{ accountQuotaSummary.miniRuns }}</strong> 次<span class="divider">/</span>Fast <strong>{{ accountQuotaSummary.fastRuns }}</strong> 次</span>
-          <span class="balance-meta" title="Mini 和 Fast 为全部额度分别用于单一模型的估算，不可相加">{{ accountOverview.exhausted }} 个额度不足</span>
+          <span class="balance-meta" title="北京时间每天 00:00 自动重置；唤醒和重启时补检查">下次 {{ nextResetLabel() }}<span class="quota-reset-zone">北京时间 · 自动重置</span></span>
         </div>
         <div class="balance-row" :class="`balance-${watermarkTone}`">
           <span class="balance-label"><ShieldCheck :size="15" />去水印次数<Info :size="13" title="仅显示服务商解析响应返回的用量，不用本地生成数量推算余额" /></span>
@@ -755,17 +766,19 @@ onBeforeUnmount(() => {
                   <span class="status-dot" aria-hidden="true"></span>
                   <strong>{{ accountStatusLabel(account) }}</strong>
                 </div>
+                <span class="account-task-count">执行 {{ account.runningTaskCount ?? (accountTask(account)?.status === 'running' ? 1 : 0) }}/{{ account.maxConcurrentTasks || savedSettings?.maxConcurrentTasksPerAccount || 3 }}<span>排队 {{ account.queuedTaskCount ?? (accountTask(account)?.status === 'accepted' ? 1 : 0) }}</span></span>
                 <span v-if="accountTask(account)" class="account-task-detail" :title="accountTask(account)?.message">{{ accountTask(account)?.message }}</span>
                 <span v-else class="account-login-state">{{ loginLabels[account.loginStatus] }}</span>
               </td>
               <td class="quota-cell">
                 <div class="quota-heading">
-                  <strong>剩余 {{ account.quotaRemaining }}<span class="quota-total"> / {{ account.dailyQuotaLimit }} 点</span></strong>
-                  <span>{{ isQuotaExhausted(account) ? "今日额度已耗尽" : `已用 ${account.quotaUsedToday}` }}</span>
+                  <strong>已用 {{ account.quotaUsedToday }}<span class="quota-total"> / {{ account.dailyQuotaLimit }} 点</span></strong>
+                  <span>{{ isQuotaExhausted(account) ? "今日额度已耗尽" : `剩余 ${account.quotaRemaining}` }}</span>
                 </div>
-                <div class="quota-progress" :class="{ exhausted: isQuotaExhausted(account) }" role="progressbar" aria-label="账号剩余额度" :aria-valuenow="account.quotaRemaining" aria-valuemin="0" :aria-valuemax="account.dailyQuotaLimit">
-                  <span :style="{ width: `${100 - quotaUsedPercent(account)}%` }"></span>
+                <div class="quota-progress" :class="{ exhausted: isQuotaExhausted(account) }" role="progressbar" aria-label="账号已用额度" :aria-valuenow="account.quotaUsedToday" aria-valuemin="0" :aria-valuemax="account.dailyQuotaLimit">
+                  <span :style="{ width: `${quotaUsedPercent(account)}%` }"></span>
                 </div>
+                <div class="quota-scale"><span>0</span><span>{{ account.dailyQuotaLimit }}</span></div>
                 <div class="quota-models">
                   <span>Mini {{ remainingGenerations(account, 'seedance_2_0_mini') }} 次</span>
                   <span>Fast {{ remainingGenerations(account, 'seedance_2_0_fast') }} 次</span>
@@ -848,8 +861,8 @@ onBeforeUnmount(() => {
             <input v-model.number="settingsForm.fastCost" type="number" min="1" />
           </label>
           <label>
-            <span>每日重置时间</span>
-            <input v-model="settingsForm.dailyResetTime" placeholder="00:00" />
+            <span>每日重置时间（北京时间）</span>
+            <input value="00:00 自动重置" readonly />
           </label>
         </div>
 
@@ -876,8 +889,12 @@ onBeforeUnmount(() => {
             <input v-model.number="settingsForm.generationTimeoutSeconds" type="number" min="60" />
           </label>
           <label>
-            <span>最大并发账号数（不同账号同时执行）</span>
+            <span>总任务并发上限</span>
             <input v-model.number="settingsForm.maxConcurrentAccounts" type="number" min="1" />
+          </label>
+          <label>
+            <span>单账号并发上限</span>
+            <input v-model.number="settingsForm.maxConcurrentTasksPerAccount" type="number" min="1" max="5" />
           </label>
           <label>
             <span>失败重试次数</span>

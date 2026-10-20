@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, ipcMain, session } from "electron";
+import { app, BrowserWindow, ipcMain, powerMonitor, session } from "electron";
+import { DailyQuotaTimer } from "./quota-clock.js";
 import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
@@ -28,6 +29,7 @@ let mainWindow: BrowserWindow | null = null;
 let db: AppDatabase;
 let executor: DoubaoExecutor;
 let apiServer: LocalApiServer;
+let quotaTimer: DailyQuotaTimer | null = null;
 
 const observeWatermarkResponse: WatermarkProviderObserver = (settings, event) => {
   db.recordWatermarkResponse(settings, event);
@@ -136,6 +138,7 @@ class LocalApiServer {
       }
 
       if (request.method === "GET" && requestUrl.pathname === "/api/accounts") {
+        refreshQuotas();
         sendJson(response, 200, { accounts: this.database.listAccounts() });
         return;
       }
@@ -167,20 +170,24 @@ class LocalApiServer {
           return;
         }
 
+        const accountId = body.accountId === undefined ? undefined : Number(body.accountId);
+        if (accountId !== undefined && (!Number.isSafeInteger(accountId) || accountId < 1)) {
+          sendJson(response, 400, { error: "accountId must be a positive integer" });
+          return;
+        }
         const referenceImagePath = await prepareReferenceImage(body, requestId);
-        const account = settings.executorEnabled
-          ? this.database.reserveAvailableAccount(model)
-          : this.database.findAvailableAccount(model);
-        const cost = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+        refreshQuotas();
+        const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio,
+          prompt, referenceImagePath, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
-        if (!account) {
+        if (!created) {
           const failed = this.database.createApiRequest({
             requestId,
             source: body.source,
             model,
             aspectRatio,
             status: "failed",
-            message: "没有可用账号，或该模型剩余额度不足",
+            message: accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
             prompt,
             referenceImagePath,
             removeWatermark: true,
@@ -198,29 +205,10 @@ class LocalApiServer {
           return;
         }
 
-        this.database.deductQuota(account.id, model);
-        const created = this.database.createApiRequest({
-          requestId,
-          source: body.source,
-          model,
-          aspectRatio,
-          accountId: account.id,
-          status: "accepted",
-          message: settings.executorEnabled
-            ? `已接收，已预扣 ${cost} 额度，已进入执行队列`
-            : `已接收，已预扣 ${cost} 额度，自动执行已关闭`,
-          prompt,
-          referenceImagePath,
-          removeWatermark: true,
-          callbackUrl: body.callbackUrl,
-          quotaCost: cost
-        });
-        if (settings.executorEnabled) {
-          this.requestExecutor.enqueue(created.requestId);
-        }
+        this.requestExecutor.enqueue(created.requestId);
         this.database.appendOperationLog({
           requestId,
-          accountId: account.id,
+          accountId: created.accountId,
           action: "接收接口请求",
           status: "success",
           message: created.message
@@ -241,6 +229,10 @@ class LocalApiServer {
         }
         if (!apiRequest.accountId) {
           sendJson(response, 409, { error: "request has no assigned account" });
+          return;
+        }
+        if (apiRequest.status === "running" || apiRequest.status === "accepted" && apiRequest.executionPhase !== "paused") {
+          sendJson(response, 409, { error: "request is already active; stop or wait before retrying its result" });
           return;
         }
         this.requestExecutor.enqueueRecovery(requestId);
@@ -377,9 +369,7 @@ async function detectLoginStatus(accountId: number) {
 
   const accountSession = session.fromPartition(account.partition);
   const cookies = await accountSession.cookies.get({ url: "https://www.doubao.com" });
-  const activeRequest = db.listApiRequests(1000).some((request) =>
-    request.accountId === accountId && (request.status === "accepted" || request.status === "running")
-  );
+  const activeRequest = account.runningTaskCount + account.queuedTaskCount > 0;
   return db.updateAccount({
     id: accountId,
     loginStatus: cookies.length > 0 ? "logged_in" : "logged_out",
@@ -414,7 +404,7 @@ async function clearAccountSession(accountId: number) {
 }
 
 function registerIpc() {
-  ipcMain.handle("accounts:list", () => db.listAccounts());
+  ipcMain.handle("accounts:list", () => { refreshQuotas(); return db.listAccounts(); });
   ipcMain.handle("accounts:create", (_event, remark?: string) => {
     const account = db.createAccount({ remark });
     recordOperation(null, account.id, "创建账号", "success", `已创建 ${account.partition}`);
@@ -468,6 +458,7 @@ function registerIpc() {
   ipcMain.handle("settings:update", async (_event, input: AppSettingsUpdateInput) => {
     const previous = db.getSettings();
     const settings = db.updateSettings(input);
+    executor.wake();
     if (previous.apiPort !== settings.apiPort || previous.apiServiceEnabled !== settings.apiServiceEnabled || previous.apiKey !== settings.apiKey) {
       await apiServer.applySettings(settings);
     }
@@ -483,7 +474,7 @@ function registerIpc() {
   ipcMain.handle("api-requests:stats", (_event, startIso: string, endIso: string) => db.getRequestStats(startIso, endIso));
   ipcMain.handle("api-requests:recover", (_event, requestId: string) => {
     const request = db.getApiRequest(requestId);
-    if (!request?.accountId || request.status === "running" || request.status === "accepted") throw new Error("任务当前无法恢复结果");
+    if (!request?.accountId || request.status === "running" || request.status === "accepted" && request.executionPhase !== "paused") throw new Error("任务当前无法恢复结果");
     executor.enqueueRecovery(requestId);
     return true;
   });
@@ -512,6 +503,13 @@ function recordOperation(
 ) {
   db.appendOperationLog({ requestId, accountId, action, status, message, targetUrl });
   notifyDataChanged();
+}
+
+function refreshQuotas() {
+  if (db.refreshDailyQuotas() > 0) {
+    executor.wake();
+    notifyDataChanged();
+  }
 }
 
 function notifyDataChanged() {
@@ -597,6 +595,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
   }
 
   return {
+    accountId: fields.accountId,
     model: fields.model as DoubaoModel | undefined,
     aspectRatio: fields.aspectRatio || null,
     prompt: fields.prompt || "",
@@ -739,8 +738,13 @@ if (!hasSingleInstanceLock) {
     db = new AppDatabase();
     executor = new DoubaoExecutor(db, notifyDataChanged, observeWatermarkResponse);
     apiServer = new LocalApiServer(db, executor);
+    const queuedRequests = db.prepareQueueAfterRestart();
+    quotaTimer = new DailyQuotaTimer(refreshQuotas);
+    quotaTimer.start();
+    powerMonitor.on("resume", () => quotaTimer?.refresh());
     registerIpc();
     await apiServer.applySettings(db.getSettings());
+    for (const requestId of queuedRequests) executor.enqueue(requestId);
     createMainWindow();
 
     app.on("activate", () => {
@@ -754,6 +758,7 @@ if (!hasSingleInstanceLock) {
 }
 
 app.on("before-quit", async () => {
+  quotaTimer?.stop();
   await apiServer?.stop();
 });
 

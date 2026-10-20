@@ -732,7 +732,7 @@ pre {
 }
 
 .quota-progress.exhausted > span {
-  background: #f59e0b;
+  background: var(--primary);
 }
 
 .quota-models {
@@ -1187,11 +1187,15 @@ button:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
 .balance-value { font-size: 18px; color: #253140; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .balance-value > span { margin-left: 7px; color: #798394; font-size: 12px; font-weight: 400; }
 .balance-track { height: 5px; overflow: hidden; background: #edf1f6; border-radius: 3px; }
-.balance-track > span { display: block; height: 100%; background: #4783e2; border-radius: 3px; }
+.balance-track > span { display: block; height: 100%; background: var(--primary); border-radius: 3px; }
+.balance-meter { min-width: 0; }
+.quota-scale { display: flex; justify-content: space-between; color: #8993a1; font-size: 10px; line-height: 14px; font-variant-numeric: tabular-nums; }
 .capacity { color: #6c7786; white-space: nowrap; text-align: center; }
 .capacity strong { color: #354253; font-size: 14px; font-variant-numeric: tabular-nums; }
 .divider { color: #d0d7e1; padding: 0 10px; }
 .balance-meta { color: #86909d; font-size: 11px; }
+.quota-reset-zone { display: block; font-size: 10px; margin-top: 2px; }
+.account-task-count { display: flex; gap: 10px; color: #607086; font-size: 11px; margin-top: 5px; font-variant-numeric: tabular-nums; }
 .balance-state { color: #6e7b8e; gap: 6px; font-size: 11px; }
 .balance-state .status-dot { width: 6px; height: 6px; }
 .balance-success .balance-value { color: #087443; }
@@ -1278,6 +1282,7 @@ button.prompt-preview:hover { color: #2563eb; }
   .activity-summary { gap: 14px; }
   .balance-row { grid-template-columns: 1fr auto; gap: 10px; padding: 12px 0; }
   .balance-row .balance-track { display: none; }
+  .balance-row .balance-meter { display: none; }
   .balance-value { text-align: right; }
   .balance-row .capacity { text-align: left; }
   .balance-row .balance-meta { text-align: right; }

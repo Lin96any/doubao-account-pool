@@ -1,5 +1,10 @@
 export const CONFIRMATION_DELAYS_MS = [60000, 120000] as const;
 
+export function recoveryCandidatesForTask(preferred: string | null, candidates: string[], ownedByOthers: string[] = []) {
+  const excluded = new Set(ownedByOthers);
+  return Array.from(new Set(preferred ? [preferred] : candidates)).filter(url => !excluded.has(url));
+}
+
 export function hasFormalGenerationAcknowledgement(text: string, modelLabel: string) {
   const compact = text.replace(/[\s*]+/g, "");
   const label = modelLabel.replace(/\s+/g, "");

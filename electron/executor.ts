@@ -21,6 +21,7 @@ import {
   hasNewTextOccurrence,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoCongestionReply,
+  isDoubaoConcurrencyLimitReply,
   isDoubaoGenerationComplete,
   isDoubaoGenerationActionText,
   isDoubaoGenerationPending,
@@ -33,7 +34,7 @@ import {
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
-import { confirmationDelayRemaining, hasFormalGenerationAcknowledgement, hasNewFormalGenerationAcknowledgement, shouldAttemptShareRecovery } from "./generation-policy.js";
+import { confirmationDelayRemaining, hasFormalGenerationAcknowledgement, hasNewFormalGenerationAcknowledgement, shouldAttemptShareRecovery, recoveryCandidatesForTask } from "./generation-policy.js";
 import { diagnoseRequest } from "./request-diagnostics.js";
 import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoAspectRatio, DoubaoModel, RequestErrorInfo } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource, WatermarkError } from "./watermark.js";
@@ -83,6 +84,8 @@ class DoubaoGenerationPendingError extends Error {
   }
 }
 
+class DoubaoConcurrencyLimitError extends Error {}
+
 class DoubaoTaskStoppedError extends Error {
   constructor() {
     super("任务已由用户终止");
@@ -103,6 +106,10 @@ export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
   private readonly stoppedRequestIds = new Set<string>();
   private readonly executionWindows = new Map<string, BrowserWindow>();
+  private readonly providerLimits = new Map<number, number>();
+  private readonly retryAt = new Map<string, number>();
+  private readonly capacityRetried = new Set<string>();
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly database: AppDatabase,
@@ -114,17 +121,33 @@ export class DoubaoExecutor {
       async (item) => {
         try {
           if (item.mode === "recover") {
-            await this.recoverResult(item.requestId);
+            return await this.recoverResult(item.requestId);
           } else {
-            await this.execute(item.requestId);
+            return await this.execute(item.requestId);
           }
         } finally {
           this.stoppedRequestIds.delete(item.requestId);
-          this.executionWindows.delete(item.requestId);
+          if (this.executionWindows.get(item.requestId)?.isDestroyed()) this.executionWindows.delete(item.requestId);
+          if (this.database.refreshDailyQuotas() > 0) this.onDataChanged();
         }
       },
-      (error) => console.error("豆包并行执行器异常", error)
+      (error) => console.error("豆包并行执行器异常", error),
+      (accountId) => Math.min(this.database.getSettings().maxConcurrentTasksPerAccount, this.providerLimits.get(accountId) || 5),
+      (item) => {
+        const task = this.database.getApiRequest(item.requestId);
+        if (!task || task.status === "stopped") return false;
+        if (item.mode === "recover") return true;
+        const account = this.database.getAccount(item.accountId);
+        return this.database.getSettings().executorEnabled && task.executionPhase === "queued"
+          && task.quotaReserved && !task.quotaRefunded && (this.retryAt.get(item.requestId) || 0) <= Date.now()
+          && account?.loginStatus === "logged_in" && account.currentStatus !== "login_required";
+      }
     );
+  }
+
+  wake() {
+    this.database.refreshDailyQuotas();
+    this.scheduler.wake();
   }
 
   enqueue(requestId: string) {
@@ -132,7 +155,7 @@ export class DoubaoExecutor {
   }
 
   enqueueRecovery(requestId: string) {
-    this.enqueueItem(requestId, "recover");
+    return this.enqueueItem(requestId, "recover");
   }
 
   stop(requestId: string) {
@@ -149,6 +172,8 @@ export class DoubaoExecutor {
 
     const result = this.database.stopApiRequestAndRefund(requestId);
     this.scheduler.cancel(requestId);
+    this.retryAt.delete(requestId);
+    this.wake();
     this.database.appendOperationLog({
       requestId,
       accountId: result.request.accountId,
@@ -187,6 +212,7 @@ export class DoubaoExecutor {
       await this.updateProgress({
         requestId,
         status: "running",
+        executionPhase: "sharing",
         message: "正在定位豆包已生成视频并重试复制分享链接"
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
@@ -204,9 +230,9 @@ export class DoubaoExecutor {
         await wait(2500);
         await dismissDoubaoDesktopDownloadPrompt(win);
         if (await looksLoggedOut(win)) throw new Error("豆包账号未登录，无法恢复视频结果");
-        recovery = await findGeneratedConversationAndCopyShare(win, request.prompt, request.doubaoThreadUrl, async (message) => {
+        recovery = await findGeneratedConversationAndCopyShare(win, request.prompt, request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
           await this.updateProgress({ requestId, status: "running", message });
-        });
+        }, this.database.getOtherBoundConversations(account.id, requestId));
       }
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
@@ -225,6 +251,7 @@ export class DoubaoExecutor {
           await this.updateProgress({
             requestId,
             status: "accepted",
+            executionPhase: "paused",
             message: "豆包仍在后台生成视频，尚未返回完成结果；稍后可手动恢复结果，不会重新提交"
           });
           this.database.updateAccount({ id: account.id, currentStatus: "idle" });
@@ -279,7 +306,7 @@ export class DoubaoExecutor {
     }
   }
 
-  private async execute(requestId: string) {
+  private async execute(requestId: string): Promise<void | "retry"> {
     const request = this.database.getApiRequest(requestId);
     if (!request) return;
 
@@ -300,9 +327,12 @@ export class DoubaoExecutor {
     let keepWindowOpen = false;
 
     try {
+      if (this.isStopped(requestId, undefined)) throw new DoubaoTaskStoppedError();
+      if (!this.database.ensureRequestQuota(requestId)) return "retry";
       await this.updateProgress({
         requestId,
         status: "running",
+        executionPhase: "submitting",
         message: "正在打开豆包执行窗口"
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
@@ -393,6 +423,11 @@ export class DoubaoExecutor {
             : `正在重试提交豆包生成（${submissionAttempt}/3）`
         });
         generationBaseline = await inspectGenerationPage(win);
+        if (!this.database.ensureRequestQuota(requestId)) {
+          await this.updateProgress({ requestId, status: "accepted", executionPhase: "queued", message: "跨日额度不足，等待新账期额度可用，不会继续提交" });
+          if (!win.isDestroyed()) win.close();
+          return "retry";
+        }
         try {
           await submitPromptAndWait(
             win,
@@ -420,12 +455,16 @@ export class DoubaoExecutor {
         }
       }
       submittedToDoubao = true;
+      this.database.markGenerationAccepted(requestId);
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
+      if (!submittedConversationUrl) throw new DoubaoGenerationPendingError("已识别豆包受理，但未取得准确对话地址；已暂停自动提交以避免串单");
       if (submittedConversationUrl) {
         await this.updateProgress({
           requestId,
           status: "running",
           message: "已记录本次豆包会话地址，等待视频完成",
+          sourceConversationUrl: submittedConversationUrl,
+          executionPhase: "generating",
           doubaoThreadUrl: submittedConversationUrl
         });
       }
@@ -446,7 +485,7 @@ export class DoubaoExecutor {
         request.prompt,
         submittedConversationUrl,
         async (message) => {
-        await this.updateProgress({ requestId, status: "running", message });
+        await this.updateProgress({ requestId, status: "running", executionPhase: /分享|复制/.test(message) ? "sharing" : "generating", message });
         }
       );
 
@@ -476,6 +515,7 @@ export class DoubaoExecutor {
       const doubaoThreadUrl = resolvedVideo.shareUrl;
       const cleanVideo = resolvedVideo.cleanVideo;
       const cleanVideoUrl = cleanVideo.url;
+      if (settings.outputDir) await this.updateProgress({ requestId, status: "running", executionPhase: "output", message: "正在保存已验证的去水印 MP4" });
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
 
       await this.updateProgress({
@@ -503,12 +543,24 @@ export class DoubaoExecutor {
         await this.updateProgress({
           requestId,
           status: "accepted",
+          executionPhase: "paused",
           message: `${error.message}；稍后可手动恢复结果，不会重新提交`
         });
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
         this.onDataChanged();
         if (win && !win.isDestroyed()) win.close();
         return;
+      }
+      if (error instanceof DoubaoConcurrencyLimitError && !submittedToDoubao && !this.capacityRetried.has(requestId)) {
+        this.capacityRetried.add(requestId);
+        this.providerLimits.set(account.id, 1);
+        this.retryAt.set(requestId, Date.now() + 60000);
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => this.wake(), 60050);
+        await this.updateProgress({ requestId, status: "accepted", executionPhase: "queued",
+          message: `豆包明确限制并发，等待已有任务结束后再尝试；该账号暂按单任务运行。页面原文：${error.message}` });
+        if (win && !win.isDestroyed()) win.close();
+        return "retry";
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
       if (shouldRefundQuota) {
@@ -523,6 +575,8 @@ export class DoubaoExecutor {
       if (win && !settings.showExecutorWindow && !keepWindowOpen && !win.isDestroyed()) {
         win.close();
       }
+    } finally {
+      this.database.refreshAccountStatus(account.id);
     }
   }
 
@@ -609,6 +663,7 @@ export class DoubaoExecutor {
       requestId,
       status: "running",
       message: "已取得当前视频分享地址，正在请求去水印服务",
+      executionPhase: "watermark",
       doubaoThreadUrl: shareUrl
     });
 
@@ -1544,7 +1599,7 @@ async function selectDoubaoAspectRatio(win: BrowserWindow, targetRatio: DoubaoAs
   );
 }
 
-async function submitPromptAndWait(
+export async function submitPromptAndWait(
   win: BrowserWindow,
   model: DoubaoModel,
   prompt: string,
@@ -1593,11 +1648,13 @@ async function submitPromptAndWait(
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
+    await onProgress("已触发本任务发送，正在独立等待豆包受理确认");
     const result = await waitForSubmissionStarted(win, model, baselineText, prompt, 12000);
     if (result.safetyConfirmationClicked) {
       await onProgress("检测到豆包素材安全确认，已点击确认");
     }
     if (result.failureMessage) {
+      if (isDoubaoConcurrencyLimitReply(result.failureMessage)) throw new DoubaoConcurrencyLimitError(result.failureMessage);
       throw new DoubaoPageFailureError(
         `豆包提交后返回失败：${result.failureMessage}`,
         isQuotaNotChargedFailure(result.failureMessage)
@@ -1608,6 +1665,7 @@ async function submitPromptAndWait(
     }
     if (result.confirmed || result.pending) return "confirmed";
     if (result.responseMessage) {
+      if (isDoubaoConcurrencyLimitReply(result.responseMessage)) throw new DoubaoConcurrencyLimitError(result.responseMessage);
       if (isDoubaoCongestionReply(result.responseMessage)) {
         throw new DoubaoCongestionError(result.responseMessage);
       }
@@ -1645,6 +1703,7 @@ async function awaitGenerationStart(
       await onProgress("已确认视频任务启动，开始计算视频生成等待时间");
       return "confirmed";
     }
+    if (isDoubaoConcurrencyLimitReply(state.failureMessage || state.responseMessage)) throw new DoubaoConcurrencyLimitError(state.failureMessage || state.responseMessage || "豆包并发受限");
     if (state.failureMessage) throw new DoubaoPageFailureError(`豆包返回失败：${state.failureMessage}`, isQuotaNotChargedFailure(state.failureMessage));
     if (isDoubaoCongestionReply(state.responseMessage)) throw new DoubaoCongestionError(state.responseMessage || "豆包繁忙");
     const now = Date.now();
@@ -2191,6 +2250,11 @@ async function waitForGenerationResult(
   let lastShareRecoveryAt = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
+    const currentConversation = extractDoubaoConversationUrl(win.webContents.getURL());
+    if (preferredConversationUrl && currentConversation && currentConversation !== preferredConversationUrl) {
+      await onProgress("检测到窗口会话变化，正在回到本任务绑定的准确对话");
+      await loadUrl(win, preferredConversationUrl);
+    }
     const pageState = await inspectGenerationPage(win);
     const newFailureMessage = pageState.failureMessage
       && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
@@ -2439,7 +2503,8 @@ async function findGeneratedConversationAndCopyShare(
   win: BrowserWindow,
   prompt: string,
   preferredConversationUrl: string | null = null,
-  onProgress: (message: string) => Promise<void> | void = () => undefined
+  onProgress: (message: string) => Promise<void> | void = () => undefined,
+  ownedByOthers: string[] = []
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
@@ -2484,10 +2549,7 @@ async function findGeneratedConversationAndCopyShare(
   const preferredUrl = isFormalDoubaoConversationUrl(preferredConversationUrl)
     ? extractDoubaoConversationUrl(preferredConversationUrl)
     : null;
-  const orderedCandidates = Array.from(new Set([
-    preferredUrl,
-    ...candidates
-  ].filter((value): value is string => Boolean(value))));
+  const orderedCandidates = recoveryCandidatesForTask(preferredUrl, candidates, ownedByOthers);
   const signatureLength = Math.min(42, normalizedPrompt.length);
   const signatureSpan = Math.max(0, normalizedPrompt.length - signatureLength);
   const signatures = Array.from(new Set([0, 0.25, 0.5, 0.75, 1]

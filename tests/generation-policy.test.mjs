@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { recoveryCandidatesForTask } from '../dist-electron/generation-policy.js'
+
+test('pins a known task conversation and excludes conversations owned by other requests', () => {
+  assert.deepEqual(recoveryCandidatesForTask('own', ['other', 'same-prompt']), ['own'])
+  assert.deepEqual(recoveryCandidatesForTask(null, ['legacy', 'other', 'legacy'], ['other']), ['legacy'])
+  assert.deepEqual(recoveryCandidatesForTask('other', ['legacy'], ['other']), [])
+})
 import { confirmationDelayRemaining, hasFormalGenerationAcknowledgement, hasNewFormalGenerationAcknowledgement, shouldAttemptShareRecovery } from '../dist-electron/generation-policy.js'
 
 test('does not accept the actual 003/004 text-only promises as a running video', () => {
