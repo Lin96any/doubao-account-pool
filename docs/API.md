@@ -3,7 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
-- 当前接口版本：`0.1.74`
+- 当前接口版本：`0.1.75`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。
@@ -22,6 +22,8 @@ Authorization: Bearer <api-key>
 ```
 
 账号记录增加 `quotaDate`（北京时间账期）、`nextQuotaResetAt`（下一次零点的 UTC ISO 时间）、`runningTaskCount`、`queuedTaskCount` 和 `maxConcurrentTasks`；原字段保持兼容。单个账号默认最多 3 条任务同时准备和发送，总任务并发上限默认 5，已有配置值不改写。
+
+0.1.75 新增 `dailyQuotaExhausted`、`quotaExhaustedDate`、`quotaExhaustedReason` 和 `availableQuota`。豆包确认今日免费次数用完时，`availableQuota` 为 0，但 `quotaRemaining`、`quotaUsedToday` 仍保留真实本地账本，不伪造消费。退款、刷新、登录检测和重启不会清除当天标记；北京时间次日零点解除，不重置付费去水印次数。
 
 ## 提交视频生成
 
@@ -60,6 +62,22 @@ Content-Type: multipart/form-data
 有足够额度但达到并发上限时，请求仍可返回 `accepted` 并预扣额度进入队列。每条任务的准备、发送和受理等待独立进行，不因同账号前一条尚未受理而串行阻塞。若豆包明确限制并发，保留原文并等待已有任务结束，不绕过限制或无限催发。
 
 每天北京时间 00:00 自动切换本地每日账期；启动、唤醒和接收请求时补检查，同一天不重复补额。正式受理的任务保留原账期，未受理的排队任务进入新账期重新预扣；余额不足继续排队，不超扣。升级时未知账期初始化为升级当天并保留当前余额，不擅自补满。此机制不修改豆包服务端额度，也不重置第三方付费去水印次数。
+
+自动分配的任务收到明确的每日次数耗尽拒绝、尚未正式受理时，可在同一个 `requestId` 下换号继续。回调先显示换号排队信息，不会先发 `failed` 再恢复运行；提示词、参考图、模型、画幅和回调地址不变，调用方无需重新提交。已发送但结果未明的任务不会因另一条任务的拒绝而换号；已正式受理的任务继续在原对话取结果。无其他可用账号或任务明确指定 `accountId` 时，直接失败并只退回尚持有的预扣。
+
+这类失败统一返回下列结构，不能与去水印服务的 `watermark / quota_exhausted` 混淆：
+
+```json
+{
+  "stage": "account",
+  "code": "doubao_daily_quota_exhausted",
+  "title": "豆包今日免费次数已用完",
+  "detail": "今日视频生成免费次数用完了，你明天再来找我继续吧。",
+  "retryable": false
+}
+```
+
+分配版本在内部用于隔离旧执行的迟到更新、退款和回调，不改变公开状态枚举、成功结果或画布接入地址。
 
 ## 无限画布接入约定
 

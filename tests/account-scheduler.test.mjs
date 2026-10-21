@@ -118,3 +118,29 @@ test('releases concurrency immediately when an active task is cancelled', async 
 
   firstGate.resolve()
 })
+
+test('pending reassignment respects the destination account cap', async () => {
+  const gates = { a: deferred(), b: deferred() }, started = []
+  const scheduler = new AccountTaskScheduler(() => 2, async item => {
+    started.push(`${item.key}:${item.accountId}`)
+    if (gates[item.key]) await gates[item.key].promise
+  })
+  scheduler.enqueue({ key: 'a', accountId: 1 }); scheduler.enqueue({ key: 'b', accountId: 2 })
+  scheduler.enqueue({ key: 'moved', accountId: 1 }); scheduler.reassignPending('moved', 2)
+  gates.a.resolve(); await nextTurn()
+  assert.deepEqual(started, ['a:1', 'b:2'])
+  gates.b.resolve(); await nextTurn()
+  assert.deepEqual(started, ['a:1', 'b:2', 'moved:2'])
+})
+
+test('an active reassignment releases the old lease before retrying under the destination cap', async () => {
+  const gate = deferred(), started = []
+  const scheduler = new AccountTaskScheduler(() => 2, async item => {
+    started.push(`${item.key}:${item.accountId}`)
+    if (item.key === 'busy') await gate.promise
+    else if (item.accountId === 1) { item.accountId = 2; return 'retry' }
+  })
+  scheduler.enqueue({ key: 'busy', accountId: 2 }); scheduler.enqueue({ key: 'moving', accountId: 1 })
+  await nextTurn(); assert.deepEqual(started, ['busy:2', 'moving:1'])
+  gate.resolve(); await nextTurn(); assert.deepEqual(started, ['busy:2', 'moving:1', 'moving:2'])
+})

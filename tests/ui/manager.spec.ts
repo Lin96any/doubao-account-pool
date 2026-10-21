@@ -3,10 +3,13 @@ import { expect, test, type Page } from '@playwright/test';
 async function installFixture(page: Page) {
   await page.addInitScript(() => {
     const now = new Date().toISOString();
+    const generationDepleted = new URLSearchParams(location.search).has('generation-depleted');
     const accounts = [10, 8, 6, 3, 0].map((remaining, index) => ({
       id: index + 1, name: `账号 ${String(index + 1).padStart(3, '0')}`, remark: index === 0 ? '主号' : index === 2 ? '动画制作' : '',
       partition: `persist:doubao_account_${String(index + 1).padStart(3, '0')}`, loginStatus: 'logged_in', currentStatus: index === 2 ? 'busy' : 'idle',
       dailyQuotaLimit: 10, quotaRemaining: remaining, quotaUsedToday: 10 - remaining, lastUsedAt: now, createdAt: now, updatedAt: now,
+      dailyQuotaExhausted: generationDepleted && index === 0, availableQuota: generationDepleted && index === 0 ? 0 : remaining,
+      quotaExhaustedReason: generationDepleted && index === 0 ? '今日视频生成免费次数用完了，你明天再来找我继续吧。' : null,
       quotaDate: '2026-10-20', nextQuotaResetAt: '2026-10-20T16:00:00.000Z', runningTaskCount: index === 2 ? 2 : 0, queuedTaskCount: index === 2 ? 1 : 0, maxConcurrentTasks: 3
     }));
     let settings: any = {
@@ -28,6 +31,11 @@ async function installFixture(page: Page) {
       { ...base, id: 1, requestId: 'doubao-ui-success', accountId: 1, accountName: '账号 001', accountPartition: accounts[0].partition, status: 'success',
         message: '视频生成完成，去水印 MP4 地址已验证', prompt: '一条完成的动画任务。', cleanVideoUrl: 'https://example.invalid/result.mp4' }
     ];
+    if (generationDepleted) requests.unshift({ ...base, id: 5, requestId: 'doubao-ui-generation-quota', accountId: 1,
+      accountName: '账号 001', accountPartition: accounts[0].partition, status: 'failed', prompt: '既有失败任务，不重新生成',
+      message: '豆包今日免费次数已用完；本任务指定了账号，不自动换号',
+      error: { stage: 'account', code: 'doubao_daily_quota_exhausted', title: '豆包今日免费次数已用完', detail: accounts[0].quotaExhaustedReason,
+        suggestion: '使用其他账号或明天重试', retryable: false } });
     const listeners: Array<() => void> = [];
     const fixture: any = { accounts, requests, listeners, saved: 0, recovered: 0, restarts: 0, settings: () => settings };
     (window as any).__fixture = fixture;
@@ -37,7 +45,7 @@ async function installFixture(page: Page) {
       accounts: { list: async () => structuredClone(accounts), detectAll: async () => structuredClone(accounts), detectLogin: async () => accounts[0], open: async () => {}, create: async () => accounts[0],
         update: async (input: any) => Object.assign(accounts.find(a => a.id === input.id)!, input), resetQuota: async () => accounts[0], resetAllQuotas: async () => accounts, relogin: async () => true, delete: async () => true },
       settings: { get: async () => ({ ...settings }), update: async (input: any) => { settings = { ...settings, ...input }; fixture.saved++; return { ...settings }; } },
-      apiServer: { status: async () => ({ version: '0.1.74', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
+      apiServer: { status: async () => ({ version: '0.1.75', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
       watermark: { status: async () => ({ configured: true, usage: unknown ? null : { remainingCount: depleted ? 0 : 468, usedCount: depleted ? 1000 : 532, totalLimit: 1000 },
         checkedAt: unknown ? null : now, usageUpdatedAt: unknown ? null : now, error: depleted ? requests[1].error : null }) },
       apiRequests: { list: async () => structuredClone(requests), todaySuccessCount: async () => 8, stats: async () => ({ todaySuccess: 8, todayFailed: 2, running: 1, queued: 0 }), clear: async () => true,
@@ -117,4 +125,27 @@ test('keeps unknown balance distinct from zero and fits a narrow viewport', asyn
   await page.goto('/?depleted');
   await expect(page.locator('.service-alert')).toContainText('补充去水印次数后恢复结果');
   await expect(page.locator('.balance-row').nth(1).locator('.balance-value')).toContainText('0');
+});
+
+test('shows provider-exhausted accounts unavailable without falsifying local spending', async ({ page }) => {
+  await page.goto('/?generation-depleted');
+  const row = page.locator('.accounts-table tbody tr').first();
+  await expect(row).toContainText('今日次数已用完');
+  await expect(row).toContainText('今日免费次数已用完');
+  await expect(row).toContainText('Mini 0 次');
+  await expect(row).toContainText('Fast 0 次');
+  await expect(row).not.toContainText('剩余 10');
+  await expect(page.locator('.balance-row').first().locator('.balance-value')).toContainText('17');
+  await expect(page.getByRole('progressbar', { name: '账号池已用或不可用额度' })).toHaveAttribute('aria-valuenow', '33');
+  await expect(page.getByRole('progressbar', { name: '豆包今日免费次数已用完', exact: true }).locator('span')).toHaveAttribute('style', 'width: 100%;');
+  expect(await page.evaluate(() => (window as any).__fixture.accounts[0].quotaUsedToday)).toBe(0);
+  await page.screenshot({ path: 'test-results/provider-quota-desktop.png', fullPage: true });
+  await page.getByLabel('状态筛选').selectOption('exhausted');
+  await expect(page.locator('.accounts-table tbody tr')).toHaveCount(2);
+  await page.getByRole('button', { name: '接口日志' }).click();
+  await page.getByLabel('问题分类').selectOption('account');
+  await expect(page.locator('.logs-table tbody tr')).toHaveCount(1);
+  await expect(page.locator('.logs-table tbody tr')).toContainText('豆包今日免费次数已用完');
+  await page.getByRole('button', { name: '详情', exact: true }).click();
+  await expect(page.getByRole('dialog')).toContainText('今日视频生成免费次数用完了');
 });

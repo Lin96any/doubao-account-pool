@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import { app } from "electron";
 import { diagnoseRequest } from "./request-diagnostics.js";
 import { nextQuotaReset, quotaDate } from "./quota-clock.js";
+import { doubaoDailyQuotaError, isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
 import { mergeWatermarkStatus, watermarkScope, type WatermarkProviderEvent } from "./watermark-state.js";
 import type {
   Account,
@@ -23,6 +24,10 @@ import type {
 
 const now = () => new Date().toISOString();
 const OPERATION_LOG_RETENTION_DAYS = 3;
+
+export class AssignmentChangedError extends Error {
+  constructor() { super("任务已换号，忽略旧执行的迟到反馈"); this.name = "AssignmentChangedError"; }
+}
 
 const DEFAULT_SETTINGS: AppSettings = {
   apiServiceEnabled: true,
@@ -143,6 +148,7 @@ export class AppDatabase {
     this.ensureDefaultSettings();
     this.migrateExecutorConcurrency();
     this.initializeQuotaPeriods();
+    this.repairDailyQuotaFailures();
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_requests_account_status ON api_requests(account_id, status)");
   }
 
@@ -159,6 +165,8 @@ export class AppDatabase {
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
         quota_date AS quotaDate,
+        quota_exhausted_date AS quotaExhaustedDate,
+        quota_exhausted_reason AS quotaExhaustedReason,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
         updated_at AS updatedAt
@@ -180,6 +188,8 @@ export class AppDatabase {
         quota_remaining AS quotaRemaining,
         quota_used_today AS quotaUsedToday,
         quota_date AS quotaDate,
+        quota_exhausted_date AS quotaExhaustedDate,
+        quota_exhausted_reason AS quotaExhaustedReason,
         last_used_at AS lastUsedAt,
         created_at AS createdAt,
         updated_at AS updatedAt
@@ -304,9 +314,9 @@ export class AppDatabase {
     return this.listAccounts();
   }
 
-  findAvailableAccount(model: DoubaoModel, accountId?: number): Account | undefined {
+  findAvailableAccount(model: DoubaoModel, accountId?: number, storedCost?: number): Account | undefined {
     const settings = this.getSettings();
-    const requiredQuota = model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+    const requiredQuota = storedCost ?? (model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost);
     const row = this.db.prepare(`
       SELECT
         id
@@ -315,6 +325,7 @@ export class AppDatabase {
         AND current_status <> 'login_required'
         AND quota_remaining >= ?
         AND quota_date = ?
+        AND (quota_exhausted_date IS NULL OR quota_exhausted_date <> ?)
         AND (? IS NULL OR id = ?)
       ORDER BY
         (SELECT COUNT(*) FROM api_requests r WHERE r.account_id = accounts.id AND r.status IN ('accepted', 'running')) ASC,
@@ -322,7 +333,7 @@ export class AppDatabase {
         last_used_at ASC,
         id ASC
       LIMIT 1
-    `).get(requiredQuota, quotaDate(this.clock()), accountId ?? null, accountId ?? null) as { id: number } | undefined;
+    `).get(requiredQuota, quotaDate(this.clock()), quotaDate(this.clock()), accountId ?? null, accountId ?? null) as { id: number } | undefined;
     return row ? this.getAccount(row.id) : undefined;
   }
 
@@ -336,9 +347,95 @@ export class AppDatabase {
       const changed = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?, last_used_at = ?, updated_at = ? WHERE id = ? AND quota_remaining >= ?`)
         .run(cost, cost, this.clock().toISOString(), this.clock().toISOString(), account.id, cost);
       if (!changed.changes) return undefined;
-      return this.createApiRequest({ ...input, accountId: account.id, status: "accepted", quotaCost: cost, quotaDay: account.quotaDate, quotaReserved: true, executionPhase: "queued",
+      return this.createApiRequest({ ...input, accountId: account.id, requestedAccountId: accountId ?? null, status: "accepted", quotaCost: cost, quotaDay: account.quotaDate, quotaReserved: true, executionPhase: "queued",
         message: settings.executorEnabled ? `已接收，已预扣 ${cost} 额度，已进入执行队列` : `已接收，已预扣 ${cost} 额度，自动执行已关闭` });
     })();
+  }
+
+  assertAssignment(request: ApiRequest | undefined, revision?: number) {
+    if (revision !== undefined && request?.assignmentRevision !== revision) throw new AssignmentChangedError();
+  }
+
+  beginRecoveryAssignment(requestId: string): ApiRequest | undefined {
+    const request = this.getApiRequest(requestId);
+    if (!request) return undefined;
+    this.db.prepare("UPDATE api_requests SET assignment_revision = assignment_revision + 1 WHERE request_id = ?").run(requestId);
+    return this.getApiRequest(requestId);
+  }
+
+  markDailyQuotaExhausted(accountId: number, reason: string) {
+    if (!isDoubaoDailyQuotaExhausted(reason)) throw new Error("不是明确的豆包每日次数耗尽回复");
+    const account = this.getAccount(accountId);
+    if (!account) throw new Error("Account not found");
+    this.db.prepare("UPDATE accounts SET quota_exhausted_date = ?, quota_exhausted_reason = ?, updated_at = ? WHERE id = ?")
+      .run(quotaDate(this.clock()), reason, this.clock().toISOString(), accountId);
+    if (!account.dailyQuotaExhausted) this.appendOperationLog({ accountId, action: "豆包今日次数已用完", status: "failed", message: reason });
+  }
+
+  handleDailyQuotaExhaustion(requestId: string, revision: number, reason: string): ApiRequest[] {
+    return this.db.transaction(() => {
+      const request = this.getApiRequest(requestId);
+      this.assertAssignment(request, revision);
+      if (!request?.accountId || !["accepted", "running"].includes(request.status)) return [];
+      this.markDailyQuotaExhausted(request.accountId, reason);
+      const queued = this.db.prepare(`SELECT request_id AS requestId FROM api_requests WHERE account_id = ?
+        AND status = 'accepted' AND execution_phase = 'queued' AND submission_sent_at IS NULL AND request_id <> ? ORDER BY id`)
+        .all(request.accountId, requestId) as Array<{ requestId: string }>;
+      const changed = request.generationAcceptedAt ? [] : [this.rerouteUnacceptedRequest(requestId, revision, true)];
+      for (const item of queued) {
+        const pending = this.getApiRequest(item.requestId)!;
+        changed.push(this.rerouteUnacceptedRequest(item.requestId, pending.assignmentRevision));
+      }
+      return changed;
+    })();
+  }
+
+  rerouteUnacceptedRequest(requestId: string, revision: number, confirmedRejection = false): ApiRequest {
+    return this.db.transaction(() => {
+      this.refreshDailyQuotas();
+      const request = this.getApiRequest(requestId);
+      this.assertAssignment(request, revision);
+      if (!request?.accountId || !["accepted", "running"].includes(request.status)) throw new AssignmentChangedError();
+      const previous = this.getAccount(request.accountId)!;
+      if (!previous.dailyQuotaExhausted) return request;
+      if (request.generationAcceptedAt || request.submissionSentAt && !confirmedRejection) {
+        throw new Error("已发送或受理的任务不能根据其他任务的反馈自动换号");
+      }
+      const reason = previous.quotaExhaustedReason || "今日视频生成免费次数已用完";
+      const next = request.requestedAccountId ? undefined : this.findAvailableAccount(request.model, undefined, request.quotaCost);
+      if (!next) return this.failExhaustedRequest(request, reason);
+
+      this.refundApiRequestQuota(requestId, revision);
+      const reserved = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?,
+        last_used_at = ?, updated_at = ? WHERE id = ? AND quota_date = ? AND quota_remaining >= ?
+        AND (quota_exhausted_date IS NULL OR quota_exhausted_date <> ?)`)
+        .run(request.quotaCost, request.quotaCost, this.clock().toISOString(), this.clock().toISOString(), next.id,
+          quotaDate(this.clock()), request.quotaCost, quotaDate(this.clock()));
+      if (!reserved.changes) throw new Error("换号预扣失败，已回滚原分配");
+      const message = `账号 ${previous.name} 今日免费次数已用完，已自动换至 ${next.name} 继续，等待执行`;
+      this.db.prepare(`UPDATE api_requests SET account_id = ?, assignment_revision = assignment_revision + 1,
+        quota_date = ?, quota_reserved = 1, quota_refunded = 0, status = 'accepted', execution_phase = 'queued',
+        submission_sent_at = NULL, generation_accepted_at = NULL, source_conversation_url = NULL, doubao_thread_url = NULL,
+        raw_video_url = NULL, clean_video_url = NULL, output_video_path = NULL, error_json = NULL,
+        message = ?, updated_at = ?, finished_at = NULL WHERE request_id = ?`)
+        .run(next.id, quotaDate(this.clock()), message, this.clock().toISOString(), requestId);
+      this.refreshAccountStatus(previous.id);
+      this.refreshAccountStatus(next.id);
+      this.appendOperationLog({ requestId, accountId: next.id, action: "额度耗尽自动换号", status: "success",
+        message: `${message}；分配版本 ${revision} -> ${revision + 1}，已释放原预扣并在新账号预扣 ${request.quotaCost} 点` });
+      return this.getApiRequest(requestId)!;
+    })();
+  }
+
+  private failExhaustedRequest(request: ApiRequest, reason: string): ApiRequest {
+    const refunded = this.refundApiRequestQuota(request.requestId, request.assignmentRevision);
+    const outcome = request.requestedAccountId ? "本任务指定了账号，不自动换号" : request.generationAcceptedAt
+      ? "本任务已记录受理，不自动重复生成" : "暂无其他有额度的可用账号";
+    const updated = this.updateApiRequest({ requestId: request.requestId, assignmentRevision: request.assignmentRevision, status: "failed",
+      message: `豆包今日免费次数已用完；${outcome}${refunded ? "；已退回预扣额度" : ""}。豆包原文：${reason}`,
+      error: doubaoDailyQuotaError(reason) });
+    this.appendOperationLog({ requestId: request.requestId, accountId: request.accountId, action: "任务失败", status: "failed", message: updated.message });
+    return updated;
   }
 
   refreshDailyQuotas(): number {
@@ -348,7 +445,10 @@ export class AppDatabase {
       const expired = this.db.prepare("SELECT id FROM accounts WHERE quota_date < ?").all(day) as Array<{ id: number }>;
       for (const { id } of expired) {
         this.db.prepare(`UPDATE accounts SET quota_date = ?, quota_remaining = daily_quota_limit, quota_used_today = 0,
-          mini_remaining = mini_daily_limit, mini_used_today = 0, fast_remaining = fast_daily_limit, fast_used_today = 0, updated_at = ? WHERE id = ?`).run(day, timestamp, id);
+          mini_remaining = mini_daily_limit, mini_used_today = 0, fast_remaining = fast_daily_limit, fast_used_today = 0,
+          quota_exhausted_reason = CASE WHEN quota_exhausted_date = ? THEN quota_exhausted_reason ELSE NULL END,
+          quota_exhausted_date = CASE WHEN quota_exhausted_date = ? THEN quota_exhausted_date ELSE NULL END,
+          updated_at = ? WHERE id = ?`).run(day, day, day, timestamp, id);
         this.db.prepare(`UPDATE api_requests SET quota_reserved = 0 WHERE account_id = ? AND status IN ('accepted', 'running')
           AND generation_accepted_at IS NULL AND execution_phase <> 'paused' AND quota_refunded = 0`).run(id);
         this.appendOperationLog({ accountId: id, action: "自动重置每日额度", status: "success", message: `北京时间 ${day} 00:00 已切换额度账期；已受理的旧任务仍归原账期` });
@@ -359,7 +459,7 @@ export class AppDatabase {
       let funded = 0;
       for (const task of waiting) {
         const result = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?, updated_at = ?
-          WHERE id = ? AND quota_date = ? AND quota_remaining >= ?`).run(task.cost, task.cost, timestamp, task.accountId, day, task.cost);
+          WHERE id = ? AND quota_date = ? AND quota_remaining >= ? AND (quota_exhausted_date IS NULL OR quota_exhausted_date <> ?)`).run(task.cost, task.cost, timestamp, task.accountId, day, task.cost, day);
         if (!result.changes) continue;
         this.db.prepare("UPDATE api_requests SET quota_reserved = 1, quota_date = ?, updated_at = ? WHERE request_id = ?").run(day, timestamp, task.requestId);
         funded++;
@@ -376,10 +476,11 @@ export class AppDatabase {
     return task.quotaReserved && !task.quotaRefunded && task.quotaDay === quotaDate(this.clock());
   }
 
-  markGenerationAccepted(requestId: string) {
+  markGenerationAccepted(requestId: string, assignmentRevision?: number) {
     return this.db.transaction(() => {
       this.refreshDailyQuotas();
       const task = this.getApiRequest(requestId);
+      this.assertAssignment(task, assignmentRevision);
       if (!task?.accountId || task.status === "stopped") throw new Error("任务已终止，不能登记生成受理");
       if (task.generationAcceptedAt) return task;
       if (!task.quotaReserved) {
@@ -487,6 +588,9 @@ export class AppDatabase {
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
         api_requests.account_id AS accountId,
+        api_requests.requested_account_id AS requestedAccountId,
+        api_requests.assignment_revision AS assignmentRevision,
+        api_requests.submission_sent_at AS submissionSentAt,
         accounts.name AS accountName,
         accounts.partition AS accountPartition,
         api_requests.status,
@@ -542,6 +646,9 @@ export class AppDatabase {
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
         api_requests.account_id AS accountId,
+        api_requests.requested_account_id AS requestedAccountId,
+        api_requests.assignment_revision AS assignmentRevision,
+        api_requests.submission_sent_at AS submissionSentAt,
         accounts.name AS accountName,
         accounts.partition AS accountPartition,
         api_requests.status,
@@ -581,6 +688,7 @@ export class AppDatabase {
         model,
         aspect_ratio,
         account_id,
+        requested_account_id,
         status,
         message,
         prompt,
@@ -595,13 +703,14 @@ export class AppDatabase {
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
       input.model,
       input.aspectRatio || "16:9",
       input.accountId ?? null,
+      input.requestedAccountId ?? null,
       input.status,
       input.message || "",
       input.prompt,
@@ -656,10 +765,11 @@ export class AppDatabase {
     })();
   }
 
-  refundApiRequestQuota(requestId: string): boolean {
+  refundApiRequestQuota(requestId: string, assignmentRevision?: number): boolean {
     this.refreshDailyQuotas();
     return this.db.transaction(() => {
       const row = this.getApiRequest(requestId);
+      this.assertAssignment(row, assignmentRevision);
       if (!row?.accountId || row.quotaRefunded || row.message.includes("已退回预扣额度")) return false;
       if (row.quotaCost <= 0) return false;
       const timestamp = now();
@@ -682,6 +792,7 @@ export class AppDatabase {
   updateApiRequest(input: ApiRequestUpdateInput) {
     const existing = this.getApiRequest(input.requestId);
     if (!existing) throw new Error("Request not found");
+    this.assertAssignment(existing, input.assignmentRevision);
 
     const status = input.status ?? existing.status;
     if (input.sourceConversationUrl && input.sourceConversationUrl !== existing.sourceConversationUrl) {
@@ -698,6 +809,7 @@ export class AppDatabase {
         doubao_thread_url = ?,
         source_conversation_url = ?,
         execution_phase = ?,
+        submission_sent_at = ?,
         raw_video_url = ?,
         clean_video_url = ?,
         output_video_path = ?,
@@ -711,6 +823,7 @@ export class AppDatabase {
       input.doubaoThreadUrl ?? existing.doubaoThreadUrl,
       input.sourceConversationUrl ?? existing.sourceConversationUrl,
       status === "success" || status === "failed" || status === "stopped" ? "finished" : input.executionPhase ?? existing.executionPhase,
+      input.submissionSentAt === undefined ? existing.submissionSentAt : input.submissionSentAt,
       input.rawVideoUrl ?? existing.rawVideoUrl,
       input.cleanVideoUrl ?? existing.cleanVideoUrl,
       input.outputVideoPath ?? existing.outputVideoPath,
@@ -823,11 +936,31 @@ export class AppDatabase {
     }
   }
 
+  private repairDailyQuotaFailures() {
+    const migration = "doubaoDailyQuotaV1";
+    if (this.db.prepare("SELECT 1 FROM settings WHERE key = ?").get(migration)) return;
+    this.db.transaction(() => {
+      const day = quotaDate(this.clock());
+      const failures = this.db.prepare(`SELECT request_id AS requestId FROM api_requests WHERE status = 'failed' AND account_id IS NOT NULL
+        AND date(created_at, '+8 hours') = ? AND date(COALESCE(finished_at, updated_at), '+8 hours') = ?
+        AND message NOT LIKE '恢复结果失败%' ORDER BY id`).all(day, day) as Array<{ requestId: string }>;
+      for (const { requestId } of failures) {
+        const request = this.getApiRequest(requestId)!;
+        if (request.error?.stage === "watermark" || !isDoubaoDailyQuotaExhausted(request.message)) continue;
+        this.markDailyQuotaExhausted(request.accountId!, request.message);
+        this.db.prepare("UPDATE api_requests SET error_json = ? WHERE request_id = ?")
+          .run(JSON.stringify(doubaoDailyQuotaError(request.message)), requestId);
+      }
+      this.db.prepare("INSERT INTO settings(key,value,updated_at) VALUES (?, 'true', ?)").run(migration, this.clock().toISOString());
+    })();
+  }
+
   private decorateAccount(account: Account): Account {
     const counts = this.db.prepare(`SELECT COALESCE(SUM(status = 'running'),0) AS runningTaskCount,
       COALESCE(SUM(status = 'accepted'),0) AS queuedTaskCount FROM api_requests WHERE account_id = ? AND status IN ('accepted','running')`)
       .get(account.id) as { runningTaskCount: number; queuedTaskCount: number };
-    return { ...account, ...counts, nextQuotaResetAt: nextQuotaReset(this.clock()),
+    const dailyQuotaExhausted = account.quotaExhaustedDate === quotaDate(this.clock());
+    return { ...account, ...counts, dailyQuotaExhausted, availableQuota: dailyQuotaExhausted ? 0 : account.quotaRemaining, nextQuotaResetAt: nextQuotaReset(this.clock()),
       maxConcurrentTasks: this.getSettings().maxConcurrentTasksPerAccount,
       currentStatus: account.loginStatus !== "logged_in" || account.currentStatus === "login_required" ? "login_required" : counts.runningTaskCount + counts.queuedTaskCount > 0 ? "busy" : "idle" };
   }
@@ -855,6 +988,8 @@ export class AppDatabase {
     this.addColumnIfMissing("accounts", "quota_remaining", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("accounts", "quota_used_today", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("accounts", "quota_date", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("accounts", "quota_exhausted_date", "TEXT");
+    this.addColumnIfMissing("accounts", "quota_exhausted_reason", "TEXT");
     this.addColumnIfMissing("accounts", "mini_daily_limit", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_remaining", "INTEGER NOT NULL DEFAULT 5");
     this.addColumnIfMissing("accounts", "mini_used_today", "INTEGER NOT NULL DEFAULT 0");
@@ -892,6 +1027,9 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "generation_accepted_at", "TEXT");
     this.addColumnIfMissing("api_requests", "source_conversation_url", "TEXT");
     this.addColumnIfMissing("api_requests", "execution_phase", "TEXT NOT NULL DEFAULT 'paused'");
+    this.addColumnIfMissing("api_requests", "requested_account_id", "INTEGER");
+    this.addColumnIfMissing("api_requests", "assignment_revision", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("api_requests", "submission_sent_at", "TEXT");
   }
 
   private cleanInvalidSuccessfulResults() {

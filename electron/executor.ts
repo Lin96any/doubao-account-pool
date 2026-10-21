@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { BrowserWindow, clipboard } from "electron";
-import type { AppDatabase } from "./database.js";
+import { AssignmentChangedError, type AppDatabase } from "./database.js";
+import { isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
 import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
   extractDoubaoConversationUrl,
@@ -85,6 +86,7 @@ class DoubaoGenerationPendingError extends Error {
 }
 
 class DoubaoConcurrencyLimitError extends Error {}
+class DoubaoAccountExhaustedError extends Error {}
 
 class DoubaoTaskStoppedError extends Error {
   constructor() {
@@ -120,11 +122,23 @@ export class DoubaoExecutor {
       () => this.database.getSettings().maxConcurrentAccounts,
       async (item) => {
         try {
-          if (item.mode === "recover") {
-            return await this.recoverResult(item.requestId);
-          } else {
-            return await this.execute(item.requestId);
+          const before = this.database.getApiRequest(item.requestId);
+          if (before?.accountId && before.accountId !== item.accountId) {
+            item.accountId = before.accountId;
+            return "retry";
           }
+          let result: void | "retry";
+          if (item.mode === "recover") {
+            result = await this.recoverResult(item.requestId);
+          } else {
+            result = await this.execute(item.requestId);
+          }
+          const latest = this.database.getApiRequest(item.requestId);
+          if (item.mode === "generate" && latest?.accountId && latest.status === "accepted" && latest.executionPhase === "queued") {
+            item.accountId = latest.accountId;
+            return "retry";
+          }
+          return result;
         } finally {
           this.stoppedRequestIds.delete(item.requestId);
           if (this.executionWindows.get(item.requestId)?.isDestroyed()) this.executionWindows.delete(item.requestId);
@@ -139,6 +153,7 @@ export class DoubaoExecutor {
         if (item.mode === "recover") return true;
         const account = this.database.getAccount(item.accountId);
         return this.database.getSettings().executorEnabled && task.executionPhase === "queued"
+          && task.accountId === item.accountId && !account?.dailyQuotaExhausted
           && task.quotaReserved && !task.quotaRefunded && (this.retryAt.get(item.requestId) || 0) <= Date.now()
           && account?.loginStatus === "logged_in" && account.currentStatus !== "login_required";
       }
@@ -188,8 +203,14 @@ export class DoubaoExecutor {
   }
 
   private enqueueItem(requestId: string, mode: QueueItem["mode"]) {
-    const request = this.database.getApiRequest(requestId);
+    let request = this.database.getApiRequest(requestId);
     if (!request?.accountId) return false;
+    if (mode === "generate" && request.executionPhase === "queued" && this.database.getAccount(request.accountId)?.dailyQuotaExhausted) {
+      request = this.database.rerouteUnacceptedRequest(requestId, request.assignmentRevision);
+      this.publishReassignments([request]);
+      if (request.status === "failed") return false;
+    }
+    if (!request.accountId) return false;
     return this.scheduler.enqueue({
       key: requestId,
       requestId,
@@ -199,17 +220,19 @@ export class DoubaoExecutor {
   }
 
   private async recoverResult(requestId: string) {
-    const request = this.database.getApiRequest(requestId);
+    const request = this.database.beginRecoveryAssignment(requestId);
     if (!request?.accountId) return;
 
     const account = this.database.getAccount(request.accountId);
     if (!account) return;
 
+    const progress = (input: Parameters<AppDatabase["updateApiRequest"]>[0]) =>
+      this.updateProgress({ ...input, assignmentRevision: request.assignmentRevision });
     const settings = this.database.getSettings();
     let win: BrowserWindow | null = null;
 
     try {
-      await this.updateProgress({
+      await progress({
         requestId,
         status: "running",
         executionPhase: "sharing",
@@ -222,7 +245,7 @@ export class DoubaoExecutor {
         : null;
       let recovery: ShareRecoveryResult;
       if (savedShare) {
-        await this.updateProgress({ requestId, status: "running", message: "正在重试已保存视频分享地址的去水印解析" });
+        await progress({ requestId, status: "running", message: "正在重试已保存视频分享地址的去水印解析" });
         recovery = { shareUrl: savedShare, candidateCount: 0, promptMatchCount: 0, generatedMatchCount: 1, pendingMatchCount: 0, failureMessage: null, shareFailureReason: null };
       } else {
         win = this.createExecutionWindow(account, settings, requestId);
@@ -231,14 +254,14 @@ export class DoubaoExecutor {
         await dismissDoubaoDesktopDownloadPrompt(win);
         if (await looksLoggedOut(win)) throw new Error("豆包账号未登录，无法恢复视频结果");
         recovery = await findGeneratedConversationAndCopyShare(win, request.prompt, request.sourceConversationUrl || request.doubaoThreadUrl, async (message) => {
-          await this.updateProgress({ requestId, status: "running", message });
+          await progress({ requestId, status: "running", message });
         }, this.database.getOtherBoundConversations(account.id, requestId));
       }
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
           const shouldRefund = isQuotaNotChargedFailure(recovery.failureMessage)
             && !request.message.includes("已退回预扣额度");
-          if (shouldRefund) this.database.refundApiRequestQuota(requestId);
+          if (shouldRefund) this.database.refundApiRequestQuota(requestId, request.assignmentRevision);
           await this.failRequest(
             request,
             `豆包已返回视频生成失败：${recovery.failureMessage}`,
@@ -248,7 +271,7 @@ export class DoubaoExecutor {
           return;
         }
         if (recovery.pendingMatchCount > 0) {
-          await this.updateProgress({
+          await progress({
             requestId,
             status: "accepted",
             executionPhase: "paused",
@@ -262,14 +285,14 @@ export class DoubaoExecutor {
         );
       }
       this.recordOperation(
-        requestId,
+        request,
         "复制分享地址",
         "success",
         "已复制豆包 thread/share 地址，等待去水印接口验证真实 MP4",
         recovery.shareUrl
       );
       const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
-        requestId,
+        request,
         settings,
         recovery.shareUrl
       );
@@ -277,7 +300,7 @@ export class DoubaoExecutor {
       const cleanVideo = resolvedVideo.cleanVideo;
       const cleanVideoUrl = cleanVideo.url;
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
-      await this.updateProgress({
+      await progress({
         requestId,
         status: "success",
         message: outputVideoPath
@@ -290,6 +313,7 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
     } catch (error) {
+      if (error instanceof AssignmentChangedError) return;
       if (this.isStopped(requestId, error)) {
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
         return;
@@ -321,6 +345,8 @@ export class DoubaoExecutor {
       return;
     }
 
+    const progress = (input: Parameters<AppDatabase["updateApiRequest"]>[0]) =>
+      this.updateProgress({ ...input, assignmentRevision: request.assignmentRevision });
     const settings = this.database.getSettings();
     let win: BrowserWindow | null = null;
     let submittedToDoubao = false;
@@ -328,8 +354,9 @@ export class DoubaoExecutor {
 
     try {
       if (this.isStopped(requestId, undefined)) throw new DoubaoTaskStoppedError();
+      if (account.dailyQuotaExhausted) throw new DoubaoAccountExhaustedError();
       if (!this.database.ensureRequestQuota(requestId)) return "retry";
-      await this.updateProgress({
+      await progress({
         requestId,
         status: "running",
         executionPhase: "submitting",
@@ -356,7 +383,7 @@ export class DoubaoExecutor {
       }
 
       const prepareSubmission = async (attempt: number) => {
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "running",
           message: attempt === 1
@@ -366,13 +393,13 @@ export class DoubaoExecutor {
         await activateVideoMode(win!, request.model);
 
         if (request.aspectRatio) {
-          await this.updateProgress({
+          await progress({
             requestId,
             status: "running",
             message: `正在设置豆包画幅：${request.aspectRatio}`
           });
           const aspectRatioResult = await selectDoubaoAspectRatio(win!, request.aspectRatio);
-          await this.updateProgress({
+          await progress({
             requestId,
             status: "running",
             message: aspectRatioResult.attempts > 0
@@ -381,14 +408,14 @@ export class DoubaoExecutor {
           });
         }
 
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "running",
           message: formatGenerationSettings(request)
         });
 
         if (request.referenceImagePath) {
-          await this.updateProgress({
+          await progress({
             requestId,
             status: "running",
             message: attempt === 1 ? "正在上传参考图" : "正在重新上传参考图"
@@ -396,7 +423,7 @@ export class DoubaoExecutor {
           await uploadReferenceImage(win!, request.referenceImagePath);
         }
 
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "running",
           message: attempt === 1 ? "正在填写提示词" : "正在重新填写提示词"
@@ -415,7 +442,7 @@ export class DoubaoExecutor {
       let generationBaseline!: Awaited<ReturnType<typeof inspectGenerationPage>>;
       for (let submissionAttempt = 1; submissionAttempt <= 3; submissionAttempt += 1) {
         await prepareSubmission(submissionAttempt);
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "running",
           message: submissionAttempt === 1
@@ -423,8 +450,13 @@ export class DoubaoExecutor {
             : `正在重试提交豆包生成（${submissionAttempt}/3）`
         });
         generationBaseline = await inspectGenerationPage(win);
+        if (this.database.getAccount(account.id)?.dailyQuotaExhausted) {
+          const current = this.database.getApiRequest(requestId)!;
+          if (current.submissionSentAt) throw new DoubaoGenerationPendingError("账号今日免费次数已用完；本任务已发送但受理尚不明确，停止重发并保留原对话");
+          throw new DoubaoAccountExhaustedError();
+        }
         if (!this.database.ensureRequestQuota(requestId)) {
-          await this.updateProgress({ requestId, status: "accepted", executionPhase: "queued", message: "跨日额度不足，等待新账期额度可用，不会继续提交" });
+          await progress({ requestId, status: "accepted", executionPhase: "queued", message: "跨日额度不足，等待新账期额度可用，不会继续提交" });
           if (!win.isDestroyed()) win.close();
           return "retry";
         }
@@ -434,8 +466,10 @@ export class DoubaoExecutor {
             request.model,
             request.prompt,
             async (message) => {
-              await this.updateProgress({ requestId, status: "running", message });
-            }
+              await progress({ requestId, status: "running", message,
+                ...message === "已触发本任务发送，正在独立等待豆包受理确认" ? { submissionSentAt: new Date().toISOString() } : {} });
+            },
+            () => !this.database.getAccount(account.id)?.dailyQuotaExhausted
           );
           break;
         } catch (error) {
@@ -443,10 +477,11 @@ export class DoubaoExecutor {
             throw error;
           }
           const delaySeconds = submissionAttempt === 1 ? 10 : 30;
-          await this.updateProgress({
+          await progress({
             requestId,
             status: "running",
-            message: `豆包返回繁忙提示：${error.reply}；${delaySeconds} 秒后自动重试`
+            message: `豆包返回繁忙提示：${error.reply}；${delaySeconds} 秒后自动重试`,
+            submissionSentAt: null
           });
           await wait(delaySeconds * 1000);
           await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
@@ -455,11 +490,11 @@ export class DoubaoExecutor {
         }
       }
       submittedToDoubao = true;
-      this.database.markGenerationAccepted(requestId);
+      this.database.markGenerationAccepted(requestId, request.assignmentRevision);
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (!submittedConversationUrl) throw new DoubaoGenerationPendingError("已识别豆包受理，但未取得准确对话地址；已暂停自动提交以避免串单");
       if (submittedConversationUrl) {
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "running",
           message: "已记录本次豆包会话地址，等待视频完成",
@@ -469,7 +504,7 @@ export class DoubaoExecutor {
         });
       }
 
-      await this.updateProgress({
+      await progress({
         requestId,
         status: "running",
         message: "已提交豆包，等待视频完成并复制分享链接"
@@ -485,7 +520,10 @@ export class DoubaoExecutor {
         request.prompt,
         submittedConversationUrl,
         async (message) => {
-        await this.updateProgress({ requestId, status: "running", executionPhase: /分享|复制/.test(message) ? "sharing" : "generating", message });
+        await progress({ requestId, status: "running", executionPhase: /分享|复制/.test(message) ? "sharing" : "generating", message });
+        },
+        (reason) => {
+          this.publishReassignments(this.database.handleDailyQuotaExhaustion(requestId, request.assignmentRevision, reason));
         }
       );
 
@@ -496,7 +534,7 @@ export class DoubaoExecutor {
       }
 
       this.recordOperation(
-        requestId,
+        request,
         "复制分享地址",
         "success",
         "已复制豆包 thread/share 地址，等待去水印接口验证真实 MP4",
@@ -508,17 +546,17 @@ export class DoubaoExecutor {
       }
 
       const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
-        requestId,
+        request,
         settings,
         generationResult.shareUrl
       );
       const doubaoThreadUrl = resolvedVideo.shareUrl;
       const cleanVideo = resolvedVideo.cleanVideo;
       const cleanVideoUrl = cleanVideo.url;
-      if (settings.outputDir) await this.updateProgress({ requestId, status: "running", executionPhase: "output", message: "正在保存已验证的去水印 MP4" });
+      if (settings.outputDir) await progress({ requestId, status: "running", executionPhase: "output", message: "正在保存已验证的去水印 MP4" });
       const outputVideoPath = await downloadCleanVideoIfNeeded(settings, requestId, cleanVideoUrl);
 
-      await this.updateProgress({
+      await progress({
         requestId,
         status: "success",
         message: outputVideoPath
@@ -535,12 +573,17 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
+      if (error instanceof AssignmentChangedError) return;
       if (this.isStopped(requestId, error)) {
         this.database.updateAccount({ id: account.id, currentStatus: "idle" });
         return;
       }
+      if (error instanceof DoubaoAccountExhaustedError || error instanceof DoubaoPageFailureError && isDoubaoDailyQuotaExhausted(error.message)) {
+        if (win && !win.isDestroyed()) win.close();
+        return this.handleQuotaRejection(request, error instanceof DoubaoAccountExhaustedError ? undefined : error.message);
+      }
       if (error instanceof DoubaoGenerationPendingError) {
-        await this.updateProgress({
+        await progress({
           requestId,
           status: "accepted",
           executionPhase: "paused",
@@ -557,14 +600,15 @@ export class DoubaoExecutor {
         this.retryAt.set(requestId, Date.now() + 60000);
         if (this.retryTimer) clearTimeout(this.retryTimer);
         this.retryTimer = setTimeout(() => this.wake(), 60050);
-        await this.updateProgress({ requestId, status: "accepted", executionPhase: "queued",
+        await progress({ requestId, status: "accepted", executionPhase: "queued",
+          submissionSentAt: null,
           message: `豆包明确限制并发，等待已有任务结束后再尝试；该账号暂按单任务运行。页面原文：${error.message}` });
         if (win && !win.isDestroyed()) win.close();
         return "retry";
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
       if (shouldRefundQuota) {
-        this.database.refundApiRequestQuota(requestId);
+        this.database.refundApiRequestQuota(requestId, request.assignmentRevision);
       }
       await this.failRequest(request, errorMessage(error), shouldRefundQuota, error instanceof WatermarkError ? error.info : undefined);
       this.database.updateAccount({
@@ -599,14 +643,38 @@ export class DoubaoExecutor {
     return updated;
   }
 
+  private publishReassignments(requests: ApiRequest[]) {
+    for (const request of requests) {
+      if (request.status === "accepted" && request.accountId) this.scheduler.reassignPending(request.requestId, request.accountId);
+      else if (!this.scheduler.isActive(request.requestId)) this.scheduler.cancel(request.requestId);
+      void postCallback(request);
+    }
+    this.onDataChanged();
+  }
+
+  private handleQuotaRejection(request: ApiRequest, reason?: string): "retry" | undefined {
+    try {
+      const changed = reason
+        ? this.database.handleDailyQuotaExhaustion(request.requestId, request.assignmentRevision, reason)
+        : [this.database.rerouteUnacceptedRequest(request.requestId, request.assignmentRevision)];
+      this.publishReassignments(changed);
+      const current = this.database.getApiRequest(request.requestId);
+      return current?.status === "accepted" && current.executionPhase === "queued" ? "retry" : undefined;
+    } catch (error) {
+      if (error instanceof AssignmentChangedError) return;
+      throw error;
+    }
+  }
+
   private recordOperation(
-    requestId: string,
+    request: ApiRequest,
     action: string,
     status: "info" | "success" | "failed",
     message: string,
     targetUrl?: string | null
   ) {
-    const request = this.database.getApiRequest(requestId);
+    const requestId = request.requestId;
+    this.database.assertAssignment(this.database.getApiRequest(requestId), request.assignmentRevision);
     this.database.appendOperationLog({
       requestId,
       accountId: request?.accountId ?? null,
@@ -619,16 +687,18 @@ export class DoubaoExecutor {
   }
 
   private resolveCleanVideoWithProgress(
-    requestId: string,
+    request: ApiRequest,
     settings: AppSettings,
     shareUrl: string,
     maxAttempts?: number
   ) {
     return (async () => {
+      const { requestId, assignmentRevision } = request;
       const startedAt = Date.now();
       let retryCount = 0;
       await this.updateProgress({
         requestId,
+        assignmentRevision,
         status: "running",
         message: "正在请求去水印服务并验证真实 MP4 地址"
       });
@@ -640,6 +710,7 @@ export class DoubaoExecutor {
           const elapsedSeconds = Math.max(1, Math.ceil(retry.elapsedMs / 1000));
           await this.updateProgress({
             requestId,
+            assignmentRevision,
             status: "running",
             message: `去水印第 ${retry.failedAttempt} 次未拿到可播放 MP4，已耗时 ${elapsedSeconds} 秒；${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
           });
@@ -655,12 +726,13 @@ export class DoubaoExecutor {
   }
 
   private async resolveCleanVideoForVerifiedShare(
-    requestId: string,
+    request: ApiRequest,
     settings: AppSettings,
     shareUrl: string
   ) {
     await this.updateProgress({
-      requestId,
+      requestId: request.requestId,
+      assignmentRevision: request.assignmentRevision,
       status: "running",
       message: "已取得当前视频分享地址，正在请求去水印服务",
       executionPhase: "watermark",
@@ -669,7 +741,7 @@ export class DoubaoExecutor {
 
     try {
       const cleanVideo = await this.resolveCleanVideoWithProgress(
-        requestId,
+        request,
         settings,
         shareUrl
       );
@@ -684,6 +756,7 @@ export class DoubaoExecutor {
     const suffix = refunded ? "，已退回预扣额度" : "";
     return this.updateProgress({
       requestId: request.requestId,
+      assignmentRevision: request.assignmentRevision,
       status: "failed",
       message: `${message}${suffix}`,
       error: error || diagnoseRequest(message)
@@ -1603,7 +1676,8 @@ export async function submitPromptAndWait(
   win: BrowserWindow,
   model: DoubaoModel,
   prompt: string,
-  onProgress: (message: string) => Promise<void> | void = () => undefined
+  onProgress: (message: string) => Promise<void> | void = () => undefined,
+  canSend: () => boolean = () => true
 ): Promise<"confirmed"> {
   const baselineText = await getRawPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
@@ -1645,6 +1719,11 @@ export async function submitPromptAndWait(
 
   const tried: string[] = [];
   for (const attempt of attempts) {
+    if (!canSend()) {
+      if (!tried.length) throw new DoubaoAccountExhaustedError();
+      const state = await waitForSubmissionStarted(win, model, baselineText, prompt, 1);
+      return awaitGenerationStart(win, model, baselineText, prompt, state, onProgress, canSend);
+    }
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
@@ -1671,7 +1750,7 @@ export async function submitPromptAndWait(
       }
     }
     if (result.sentEvidence || result.responseMessage || result.confirmationClicked) {
-      return awaitGenerationStart(win, model, baselineText, prompt, result, onProgress);
+      return awaitGenerationStart(win, model, baselineText, prompt, result, onProgress, canSend);
     }
   }
 
@@ -1688,7 +1767,8 @@ async function awaitGenerationStart(
   baselineText: string,
   prompt: string,
   initial: Awaited<ReturnType<typeof waitForSubmissionStarted>>,
-  onProgress: (message: string) => Promise<void> | void
+  onProgress: (message: string) => Promise<void> | void,
+  canSend: () => boolean
 ): Promise<"confirmed"> {
   let state = initial;
   let stableSince = Date.now();
@@ -1720,7 +1800,7 @@ async function awaitGenerationStart(
       await onProgress("检测到对话中新增确认生成指令，继续等待任务启动");
     }
     const remaining = confirmationDelayRemaining({ now, stableSince, lastConfirmationAt, confirmationCount: confirmations, accepted: false, responding: state.responding, hasDraft: state.hasDraft });
-    if (remaining === 0) {
+    if (remaining === 0 && canSend()) {
       // Inspect again immediately before writing so manual input and late
       // acceptance observed during the delay cannot trigger a duplicate send.
       const checked = await waitForSubmissionStarted(win, model, baselineText, prompt, 1);
@@ -1728,9 +1808,11 @@ async function awaitGenerationStart(
         state = checked;
         continue;
       }
+      if (!canSend()) { state = checked; continue; }
       await fillPrompt(win, DIRECT_GENERATION_CONFIRM_FOLLOW_UP);
       const composer = await inspectComposer(win, DIRECT_GENERATION_CONFIRM_FOLLOW_UP);
       if (!composer.promptPresent) throw new Error("未能填入确认生成指令，已停止自动补发");
+      if (!canSend()) throw new DoubaoGenerationPendingError("账号今日次数已用完，不再补发确认；原任务是否受理尚待确认");
       const sendPoint = await findComposerSendButtonPoint(win);
       if (sendPoint) await sendMouseClick(win, sendPoint.x, sendPoint.y);
       else await sendKeyboard(win, "Enter");
@@ -1741,13 +1823,14 @@ async function awaitGenerationStart(
       await onProgress(`尚未确认视频启动，已补发“确认生成”，第 ${Math.min(confirmations, 2)}/2 次`);
     } else if (now - lastProgressAt > 15000) {
       lastProgressAt = now;
-      await onProgress(state.responding ? "豆包正在回复，等待回复结束后确认视频任务" : remaining === null
+      await onProgress(!canSend() ? "账号今日次数已用完，继续检查本任务受理状态，不再补发生成指令" : state.responding ? "豆包正在回复，等待回复结束后确认视频任务" : remaining === null
         ? "尚未确认视频启动，等待本次确认回复"
         : `尚未确认视频启动，${Math.ceil(remaining / 1000)} 秒后补发“确认生成”`);
     }
     if (confirmations >= 2 && !state.responding && !state.hasDraft && now - Math.max(lastConfirmationAt, stableSince) >= 120000) break;
     state = await waitForSubmissionStarted(win, model, baselineText, prompt, 3000);
   }
+  if (!canSend()) throw new DoubaoGenerationPendingError("账号今日次数已用完；本任务已发送但受理尚不明确，停止重发并保留原对话");
   if (state.responding || state.hasDraft) {
     throw new DoubaoGenerationPendingError("尚未确认视频启动，页面仍在回复或存在手动输入；已暂停自动补发");
   }
@@ -2235,7 +2318,8 @@ async function waitForGenerationResult(
   baselineVideoCardCount: number,
   prompt: string,
   preferredConversationUrl: string | null,
-  onProgress: (message: string) => Promise<void> | void
+  onProgress: (message: string) => Promise<void> | void,
+  onQuotaExhaustion?: (reason: string) => void
 ): Promise<GenerationResult> {
   const timeoutMs = Math.max(60, timeoutSeconds || 900) * 1000;
   const historyFallbackMs = Math.max(30000, Math.min(360000, Math.floor(timeoutMs * 0.6)));
@@ -2248,6 +2332,7 @@ async function waitForGenerationResult(
   let historyFallbackAttempted = false;
   let generatedRecoveryAttempted = false;
   let lastShareRecoveryAt = 0;
+  let quotaNoticeSeen = false;
 
   while (Date.now() - startedAt < timeoutMs) {
     const currentConversation = extractDoubaoConversationUrl(win.webContents.getURL());
@@ -2260,7 +2345,10 @@ async function waitForGenerationResult(
       && hasNewTextOccurrence(pageState.pageText, baselineText, pageState.failureMessage)
       ? pageState.failureMessage
       : null;
-    if (newFailureMessage) {
+    if (newFailureMessage && isDoubaoDailyQuotaExhausted(newFailureMessage) && onQuotaExhaustion) {
+      if (!quotaNoticeSeen) onQuotaExhaustion(newFailureMessage);
+      quotaNoticeSeen = true;
+    } else if (newFailureMessage) {
       throw new DoubaoPageFailureError(
         `豆包已返回视频生成失败：${newFailureMessage}`,
         isQuotaNotChargedFailure(newFailureMessage)
@@ -2391,6 +2479,10 @@ async function waitForGenerationResult(
     return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
   }
   if (recovery.failureMessage) {
+    if (onQuotaExhaustion && isDoubaoDailyQuotaExhausted(recovery.failureMessage)) {
+      if (!quotaNoticeSeen) onQuotaExhaustion(recovery.failureMessage);
+      throw new DoubaoGenerationPendingError("本任务已正式受理，账号随后提示今日次数用完；保留原任务等待结果，不重新生成或退还已受理额度");
+    }
     throw new DoubaoPageFailureError(
       `豆包已返回视频生成失败：${recovery.failureMessage}`,
       isQuotaNotChargedFailure(recovery.failureMessage)

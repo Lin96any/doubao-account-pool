@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, ipcMain, powerMonitor, session } from "electron";
 import { DailyQuotaTimer } from "./quota-clock.js";
+import { doubaoDailyQuotaError } from "./doubao-quota-state.js";
 import log from "electron-log/main.js";
 import { AppDatabase } from "./database.js";
 import { DoubaoExecutor } from "./executor.js";
@@ -181,18 +182,22 @@ class LocalApiServer {
           prompt, referenceImagePath, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
         if (!created) {
+          const pinnedExhausted = accountId ? this.database.getAccount(accountId)?.dailyQuotaExhausted : false;
           const failed = this.database.createApiRequest({
             requestId,
             source: body.source,
             model,
             aspectRatio,
             status: "failed",
-            message: accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
+            message: pinnedExhausted ? "豆包今日免费次数已用完；本任务指定了账号，不自动换号" : accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
+            accountId: pinnedExhausted ? accountId : undefined,
+            requestedAccountId: accountId,
             prompt,
             referenceImagePath,
             removeWatermark: true,
             callbackUrl: body.callbackUrl
           });
+          if (pinnedExhausted) this.database.updateApiRequest({ requestId, error: doubaoDailyQuotaError(this.database.getAccount(accountId!)?.quotaExhaustedReason || failed.message) });
           this.database.appendOperationLog({
             requestId,
             action: "分配账号",
@@ -200,8 +205,9 @@ class LocalApiServer {
             message: failed.message
           });
           notifyDataChanged();
-          void postCallback(failed);
-          sendJson(response, 409, toPublicApiRequest(failed));
+          const finalFailure = this.database.getApiRequest(requestId)!;
+          void postCallback(finalFailure);
+          sendJson(response, 409, toPublicApiRequest(finalFailure));
           return;
         }
 

@@ -179,7 +179,7 @@ const accountOverview = computed(() => ({
 
 const accountQuotaSummary = computed(() => {
   const total = accounts.value.reduce((sum, account) => sum + account.dailyQuotaLimit, 0);
-  const remaining = accounts.value.reduce((sum, account) => sum + account.quotaRemaining, 0);
+  const remaining = accounts.value.reduce((sum, account) => sum + availableQuota(account), 0);
   const used = Math.max(0, total - remaining);
 
   return {
@@ -546,7 +546,11 @@ function minimumQuotaCost() {
 }
 
 function isQuotaExhausted(account: Account) {
-  return account.quotaRemaining < minimumQuotaCost();
+  return account.dailyQuotaExhausted || availableQuota(account) < minimumQuotaCost();
+}
+
+function availableQuota(account: Account) {
+  return account.dailyQuotaExhausted ? 0 : account.availableQuota ?? account.quotaRemaining;
 }
 
 function isLoginRequired(account: Account) {
@@ -559,6 +563,7 @@ function isAccountAvailable(account: Account) {
 
 function accountStatusLabel(account: Account) {
   if (isLoginRequired(account)) return "登录失效";
+  if (account.dailyQuotaExhausted) return "今日次数已用完";
   if (account.currentStatus === "error") return "启动失败";
   const task = accountTask(account);
   if (task) return requestPhase(task);
@@ -582,7 +587,7 @@ function quotaUsedPercent(account: Account) {
 function remainingGenerations(account: Account, model: DoubaoModel) {
   const settings = savedSettings.value || settingsForm;
   const cost = model === "seedance_2_0_mini" ? Number(settings.miniCost) : Number(settings.fastCost);
-  return Math.floor(account.quotaRemaining / Math.max(1, cost || 1));
+  return Math.floor(availableQuota(account) / Math.max(1, cost || 1));
 }
 
 function toggleAccountMenu(accountId: number) {
@@ -684,7 +689,7 @@ onBeforeUnmount(() => {
         <div class="balance-row">
           <span class="balance-label"><Users :size="15" />豆包今日额度<Info :size="13" title="本地调度额度，执行中的任务已预扣；不是豆包官方余额" /></span>
           <strong class="balance-value">{{ accountQuotaSummary.remaining }}<span>/ {{ accountQuotaSummary.total }} 点剩余</span></strong>
-          <div class="balance-meter"><div class="quota-scale"><span>0</span><span>已用 {{ accountQuotaSummary.used }}</span><span>{{ accountQuotaSummary.total }}</span></div><div class="balance-track" role="progressbar" aria-label="账号池已用额度" :aria-valuenow="accountQuotaSummary.used" :aria-valuemax="accountQuotaSummary.total" aria-valuemin="0"><span :style="{ width: `${accountQuotaSummary.usedPercent}%` }"></span></div></div>
+          <div class="balance-meter"><div class="quota-scale"><span>0</span><span>已用／不可用 {{ accountQuotaSummary.used }}</span><span>{{ accountQuotaSummary.total }}</span></div><div class="balance-track" role="progressbar" aria-label="账号池已用或不可用额度" :aria-valuenow="accountQuotaSummary.used" :aria-valuemax="accountQuotaSummary.total" aria-valuemin="0"><span :style="{ width: `${accountQuotaSummary.usedPercent}%` }"></span></div></div>
           <span class="capacity">Mini <strong>{{ accountQuotaSummary.miniRuns }}</strong> 次<span class="divider">/</span>Fast <strong>{{ accountQuotaSummary.fastRuns }}</strong> 次</span>
           <span class="balance-meta" title="北京时间每天 00:00 自动重置；唤醒和重启时补检查">下次 {{ nextResetLabel() }}<span class="quota-reset-zone">北京时间 · 自动重置</span></span>
         </div>
@@ -771,12 +776,15 @@ onBeforeUnmount(() => {
                 <span v-else class="account-login-state">{{ loginLabels[account.loginStatus] }}</span>
               </td>
               <td class="quota-cell">
-                <div class="quota-heading">
+                <div v-if="account.dailyQuotaExhausted" class="quota-heading" :title="account.quotaExhaustedReason || ''">
+                  <strong>今日免费次数已用完</strong><span>豆包已确认</span>
+                </div>
+                <div v-else class="quota-heading">
                   <strong>已用 {{ account.quotaUsedToday }}<span class="quota-total"> / {{ account.dailyQuotaLimit }} 点</span></strong>
                   <span>{{ isQuotaExhausted(account) ? "今日额度已耗尽" : `剩余 ${account.quotaRemaining}` }}</span>
                 </div>
-                <div class="quota-progress" :class="{ exhausted: isQuotaExhausted(account) }" role="progressbar" aria-label="账号已用额度" :aria-valuenow="account.quotaUsedToday" aria-valuemin="0" :aria-valuemax="account.dailyQuotaLimit">
-                  <span :style="{ width: `${quotaUsedPercent(account)}%` }"></span>
+                <div class="quota-progress" :class="{ exhausted: isQuotaExhausted(account) }" role="progressbar" :aria-label="account.dailyQuotaExhausted ? '豆包今日免费次数已用完' : '账号已用额度'" :aria-valuenow="account.dailyQuotaExhausted ? account.dailyQuotaLimit : account.quotaUsedToday" aria-valuemin="0" :aria-valuemax="account.dailyQuotaLimit">
+                  <span :style="{ width: `${account.dailyQuotaExhausted ? 100 : quotaUsedPercent(account)}%` }"></span>
                 </div>
                 <div class="quota-scale"><span>0</span><span>{{ account.dailyQuotaLimit }}</span></div>
                 <div class="quota-models">

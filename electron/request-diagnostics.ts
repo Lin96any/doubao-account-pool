@@ -1,4 +1,5 @@
 import type { ApiRequest, FailureStage, RequestErrorInfo } from "./types.js";
+import { doubaoDailyQuotaError, isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
 
 export function requestError(
   stage: FailureStage, code: string, title: string, detail: string, suggestion: string, retryable = false
@@ -39,6 +40,7 @@ export function classifyWatermarkFailure(message: string, httpStatus?: number): 
 }
 
 export function diagnoseRequest(message: string): RequestErrorInfo {
+  if (isDoubaoDailyQuotaExhausted(message)) return doubaoDailyQuotaError(message);
   if (/去水印(?:接口|服务|结果|视频地址| Token)|未配置去水印/.test(message)) return classifyWatermarkFailure(message);
   if (/未提取到.*分享链接|未复制到分享链接|分享面板|复制.*失败|分享.*同步/.test(message)) {
     return requestError("sharing", "share_unavailable", "未取得视频分享链接", message, "已有视频可恢复结果，无需重新生成。", true);

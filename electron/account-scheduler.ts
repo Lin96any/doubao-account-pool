@@ -41,6 +41,14 @@ export class AccountTaskScheduler<T extends AccountTask> {
     return this.active.has(key);
   }
 
+  reassignPending(key: string, accountId: number) {
+    const item = this.pending.find(item => item.key === key);
+    if (!item) return false;
+    item.accountId = accountId;
+    this.drain();
+    return true;
+  }
+
   wake() { this.drain(); }
 
   private drain() {

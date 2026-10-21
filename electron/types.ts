@@ -48,6 +48,10 @@ export interface Account {
   quotaRemaining: number;
   quotaUsedToday: number;
   quotaDate: string;
+  dailyQuotaExhausted: boolean;
+  quotaExhaustedDate: string | null;
+  quotaExhaustedReason: string | null;
+  availableQuota: number;
   nextQuotaResetAt: string;
   runningTaskCount: number;
   queuedTaskCount: number;
@@ -103,6 +107,9 @@ export interface ApiRequest {
   model: DoubaoModel;
   aspectRatio: DoubaoAspectRatio;
   accountId: number | null;
+  requestedAccountId: number | null;
+  assignmentRevision: number;
+  submissionSentAt: string | null;
   accountName: string | null;
   accountPartition: string | null;
   status: ApiRequestStatus;
@@ -134,6 +141,7 @@ export interface ApiRequestCreateInput {
   model: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | null;
   accountId?: number | null;
+  requestedAccountId?: number | null;
   status: ApiRequestStatus;
   message?: string;
   prompt: string;
@@ -148,6 +156,8 @@ export interface ApiRequestCreateInput {
 
 export interface ApiRequestUpdateInput {
   requestId: string;
+  assignmentRevision?: number;
+  submissionSentAt?: string | null;
   status?: ApiRequestStatus;
   message?: string;
   doubaoThreadUrl?: string | null;
