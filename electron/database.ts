@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import { app } from "electron";
 import { diagnoseRequest } from "./request-diagnostics.js";
 import { nextQuotaReset, quotaDate } from "./quota-clock.js";
+import { quotaAmount } from "./quota-amount.js";
 import { doubaoDailyQuotaError, isDoubaoDailyQuotaExhausted } from "./doubao-quota-state.js";
 import { mergeWatermarkStatus, watermarkScope, type WatermarkProviderEvent } from "./watermark-state.js";
 import type {
@@ -265,8 +266,8 @@ export class AppDatabase {
       updated.loginStatus,
       updated.currentStatus,
       clampInt(updated.dailyQuotaLimit),
-      clampInt(updated.quotaRemaining),
-      clampInt(updated.quotaUsedToday),
+      quotaAmount(updated.quotaRemaining),
+      quotaAmount(updated.quotaUsedToday),
       updated.updatedAt,
       input.id
     );
@@ -344,7 +345,7 @@ export class AppDatabase {
       if (!account) return undefined;
       const settings = this.getSettings();
       const cost = input.model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
-      const changed = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?, last_used_at = ?, updated_at = ? WHERE id = ? AND quota_remaining >= ?`)
+      const changed = this.db.prepare(`UPDATE accounts SET quota_remaining = ROUND(quota_remaining - ?, 1), quota_used_today = ROUND(quota_used_today + ?, 1), last_used_at = ?, updated_at = ? WHERE id = ? AND quota_remaining >= ?`)
         .run(cost, cost, this.clock().toISOString(), this.clock().toISOString(), account.id, cost);
       if (!changed.changes) return undefined;
       return this.createApiRequest({ ...input, accountId: account.id, requestedAccountId: accountId ?? null, status: "accepted", quotaCost: cost, quotaDay: account.quotaDate, quotaReserved: true, executionPhase: "queued",
@@ -406,7 +407,7 @@ export class AppDatabase {
       if (!next) return this.failExhaustedRequest(request, reason);
 
       this.refundApiRequestQuota(requestId, revision);
-      const reserved = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?,
+      const reserved = this.db.prepare(`UPDATE accounts SET quota_remaining = ROUND(quota_remaining - ?, 1), quota_used_today = ROUND(quota_used_today + ?, 1),
         last_used_at = ?, updated_at = ? WHERE id = ? AND quota_date = ? AND quota_remaining >= ?
         AND (quota_exhausted_date IS NULL OR quota_exhausted_date <> ?)`)
         .run(request.quotaCost, request.quotaCost, this.clock().toISOString(), this.clock().toISOString(), next.id,
@@ -458,7 +459,7 @@ export class AppDatabase {
           AND generation_accepted_at IS NULL AND execution_phase <> 'paused' ORDER BY id ASC`).all() as Array<{ requestId: string; accountId: number; cost: number }>;
       let funded = 0;
       for (const task of waiting) {
-        const result = this.db.prepare(`UPDATE accounts SET quota_remaining = quota_remaining - ?, quota_used_today = quota_used_today + ?, updated_at = ?
+        const result = this.db.prepare(`UPDATE accounts SET quota_remaining = ROUND(quota_remaining - ?, 1), quota_used_today = ROUND(quota_used_today + ?, 1), updated_at = ?
           WHERE id = ? AND quota_date = ? AND quota_remaining >= ? AND (quota_exhausted_date IS NULL OR quota_exhausted_date <> ?)`).run(task.cost, task.cost, timestamp, task.accountId, day, task.cost, day);
         if (!result.changes) continue;
         this.db.prepare("UPDATE api_requests SET quota_reserved = 1, quota_date = ?, updated_at = ? WHERE request_id = ?").run(day, timestamp, task.requestId);
@@ -485,7 +486,7 @@ export class AppDatabase {
       if (task.generationAcceptedAt) return task;
       if (!task.quotaReserved) {
         // Preserve a real platform acceptance even if the clock/limit changed during the reply.
-        this.db.prepare(`UPDATE accounts SET quota_remaining = MAX(0, quota_remaining - ?), quota_used_today = quota_used_today + ? WHERE id = ?`)
+        this.db.prepare(`UPDATE accounts SET quota_remaining = MAX(0, ROUND(quota_remaining - ?, 1)), quota_used_today = ROUND(quota_used_today + ?, 1) WHERE id = ?`)
           .run(task.quotaCost, task.quotaCost, task.accountId);
       }
       this.db.prepare(`UPDATE api_requests SET generation_accepted_at = ?, quota_date = ?, quota_reserved = 1, execution_phase = 'generating' WHERE request_id = ?`)
@@ -527,8 +528,8 @@ export class AppDatabase {
       autoCloseExecutorWindow: Boolean(input.autoCloseExecutorWindow ?? current.autoCloseExecutorWindow),
       doubaoChatUrl: String(input.doubaoChatUrl || current.doubaoChatUrl || DEFAULT_SETTINGS.doubaoChatUrl),
       dailyQuotaLimit: clampInt(input.dailyQuotaLimit ?? current.dailyQuotaLimit),
-      miniCost: Math.max(1, clampInt(input.miniCost ?? current.miniCost)),
-      fastCost: Math.max(1, clampInt(input.fastCost ?? current.fastCost)),
+      miniCost: Math.max(1, quotaAmount(input.miniCost ?? current.miniCost)),
+      fastCost: Math.max(1, quotaAmount(input.fastCost ?? current.fastCost)),
       generationTimeoutSeconds: clampInt(input.generationTimeoutSeconds ?? current.generationTimeoutSeconds),
       maxConcurrentAccounts: Math.max(1, clampInt(input.maxConcurrentAccounts ?? current.maxConcurrentAccounts)),
       maxConcurrentTasksPerAccount: Math.min(5, Math.max(1, clampInt(input.maxConcurrentTasksPerAccount ?? current.maxConcurrentTasksPerAccount))),
@@ -717,7 +718,7 @@ export class AppDatabase {
       input.referenceImagePath || null,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
-      Math.max(0, clampInt(input.quotaCost || 0)),
+      quotaAmount(input.quotaCost || 0),
       input.quotaDay || null,
       input.quotaReserved ? 1 : 0,
       input.executionPhase || (input.status === "accepted" || input.status === "running" ? "paused" : "finished"),
@@ -776,8 +777,8 @@ export class AppDatabase {
       const account = this.getAccount(row.accountId);
       if (row.quotaReserved && row.quotaDay === account?.quotaDate) this.db.prepare(`
         UPDATE accounts
-        SET quota_remaining = MIN(daily_quota_limit, quota_remaining + ?),
-            quota_used_today = MAX(0, quota_used_today - ?),
+        SET quota_remaining = MIN(daily_quota_limit, ROUND(quota_remaining + ?, 1)),
+            quota_used_today = MAX(0, ROUND(quota_used_today - ?, 1)),
             updated_at = ?
         WHERE id = ?
       `).run(row.quotaCost, row.quotaCost, timestamp, row.accountId);

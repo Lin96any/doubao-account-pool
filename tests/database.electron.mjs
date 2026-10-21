@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { app, BrowserWindow } from 'electron'
 import Database from 'better-sqlite3'
+import http from 'node:http'
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'doubao-isolated-db-'))
 app.setPath('userData', profile)
@@ -100,6 +101,29 @@ app.whenReady().then(async () => {
   await Promise.all(windows.map(window => window.webContents.executeJavaScript(`document.getElementById('reply').innerText = '本次使用 Seedance 2.0 Mini 生成，预计等待 10 分钟。视频生成好后，我会主动发送给你。'`)))
   assert.deepEqual(await Promise.all(submissions), ['confirmed', 'confirmed', 'confirmed'])
   windows.forEach(window => window.destroy())
+  const seen = []
+  let origin
+  const mock = http.createServer((req, res) => {
+    if (req.url.startsWith('/video.mp4')) {
+      res.writeHead(206, { 'content-type': 'video/mp4' }); res.end(Buffer.from('00000018667479706d703432', 'hex'))
+    } else {
+      seen.push([req.url.split('?')[0], req.headers.authorization])
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ code: 200, data: { url: `${origin}/video.mp4`, usage: { remainingCount: 91 } } }))
+    }
+  })
+  try {
+    await new Promise(resolve => mock.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${mock.address().port}`
+    const oldSettings = database.updateSettings({ watermarkApiUrl: `${origin}/old`, watermarkApiToken: 'fixture-old' })
+    const task = database.createApiRequest({ requestId: 'executor-live-settings', model: 'seedance_2_0_mini', status: 'running', prompt: 'fixture' })
+    database.updateSettings({ watermarkApiUrl: `${origin}/new`, watermarkApiToken: 'fixture-new' })
+    const { DoubaoExecutor } = await import('../dist-electron/executor.js')
+    const executor = new DoubaoExecutor(database, () => {}, (settings, event) => database.recordWatermarkResponse(settings, event))
+    await executor.resolveCleanVideoWithProgress(task, oldSettings, 'https://www.doubao.com/thread/fixture', 1)
+    assert.deepEqual(seen, [['/new', 'fixture-new']])
+    assert.equal(database.getWatermarkStatus().usage.remainingCount, 91)
+    database.recordWatermarkResponse(oldSettings, { checkedAt: new Date().toISOString(), usage: { remainingCount: 0 }, error: failure })
+    assert.equal(database.getWatermarkStatus().usage.remainingCount, 91, 'Late old-token responses cannot replace the current token balance')
+  } finally { await new Promise(resolve => mock.close(resolve)) }
   console.log('ISOLATED_DATABASE_OK')
 } catch (error) {
   console.error(error)

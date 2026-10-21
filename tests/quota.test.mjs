@@ -11,7 +11,7 @@ test('quota periods and concurrent task accounting in isolated Electron database
   const line = result.stdout.split('\n').find(value => value.startsWith('QUOTA_RESULTS '))
   assert.ok(line, result.stdout + result.stderr)
   const cases = JSON.parse(line.slice('QUOTA_RESULTS '.length))
-  assert.equal(cases.length, 13)
+  assert.equal(cases.length, 17)
   for (const item of cases) await t.test(item.name, () => assert.equal(item.ok, true, item.error))
   assert.equal(result.status, 0, result.stderr)
 })

@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { Check, ChevronDown, ClipboardList, Copy, ExternalLink, History, Info, MoreHorizontal, Plus, RefreshCw, RotateCcw, Save, Search, Settings2, ShieldCheck, Square, Trash2, Users, X } from "@lucide/vue";
 import { failureStageLabels, getRequestError, requestPhase } from "../electron/request-diagnostics";
+import { quotaAmount, quotaRuns } from "../electron/quota-amount";
 import type {
   Account,
   AccountRuntimeStatus,
@@ -127,7 +128,7 @@ const modelLabels: Record<DoubaoModel, string> = {
 };
 
 const modalRemainingQuota = computed(() =>
-  Math.max(0, Number(accountSettingsForm.dailyQuotaLimit || 0) - Number(accountSettingsForm.quotaUsedToday || 0))
+  quotaAmount(Number(accountSettingsForm.dailyQuotaLimit || 0) - Number(accountSettingsForm.quotaUsedToday || 0))
 );
 
 const filteredApiRequests = computed(() => {
@@ -179,8 +180,8 @@ const accountOverview = computed(() => ({
 
 const accountQuotaSummary = computed(() => {
   const total = accounts.value.reduce((sum, account) => sum + account.dailyQuotaLimit, 0);
-  const remaining = accounts.value.reduce((sum, account) => sum + availableQuota(account), 0);
-  const used = Math.max(0, total - remaining);
+  const remaining = quotaAmount(accounts.value.reduce((sum, account) => sum + availableQuota(account), 0));
+  const used = quotaAmount(total - remaining);
 
   return {
     total,
@@ -353,12 +354,12 @@ function closeAccountSettings() {
 async function saveAccountSettings() {
   if (!editingAccount.value) return;
   const total = Math.max(0, Math.floor(Number(accountSettingsForm.dailyQuotaLimit) || 0));
-  const used = Math.min(total, Math.max(0, Math.floor(Number(accountSettingsForm.quotaUsedToday) || 0)));
+  const used = Math.min(total, quotaAmount(Number(accountSettingsForm.quotaUsedToday) || 0));
   await window.doubaoManager.accounts.update({
     id: editingAccount.value.id,
     remark: accountSettingsForm.remark.trim(),
     dailyQuotaLimit: total,
-    quotaRemaining: total - used,
+    quotaRemaining: quotaAmount(total - used),
     quotaUsedToday: used
   });
   closeAccountSettings();
@@ -587,7 +588,7 @@ function quotaUsedPercent(account: Account) {
 function remainingGenerations(account: Account, model: DoubaoModel) {
   const settings = savedSettings.value || settingsForm;
   const cost = model === "seedance_2_0_mini" ? Number(settings.miniCost) : Number(settings.fastCost);
-  return Math.floor(availableQuota(account) / Math.max(1, cost || 1));
+  return quotaRuns(availableQuota(account), cost || 1);
 }
 
 function toggleAccountMenu(accountId: number) {
@@ -862,11 +863,11 @@ onBeforeUnmount(() => {
           </label>
           <label>
             <span>Mini 单次消耗</span>
-            <input v-model.number="settingsForm.miniCost" type="number" min="1" />
+            <input v-model.number="settingsForm.miniCost" type="number" min="1" step="0.1" />
           </label>
           <label>
             <span>Fast 单次消耗</span>
-            <input v-model.number="settingsForm.fastCost" type="number" min="1" />
+            <input v-model.number="settingsForm.fastCost" type="number" min="1" step="0.1" />
           </label>
           <label>
             <span>每日重置时间（北京时间）</span>
@@ -1226,7 +1227,7 @@ onBeforeUnmount(() => {
         </label>
         <label>
           <span>今日已消耗额度</span>
-          <input v-model.number="accountSettingsForm.quotaUsedToday" type="number" min="0" />
+          <input v-model.number="accountSettingsForm.quotaUsedToday" type="number" min="0" step="0.1" />
         </label>
         <div class="readonly-quota">
           <span>自动计算剩余额度</span>

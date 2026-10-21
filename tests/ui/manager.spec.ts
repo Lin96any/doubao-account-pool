@@ -43,9 +43,9 @@ async function installFixture(page: Page) {
     const depleted = new URLSearchParams(location.search).has('depleted');
     (window as any).doubaoManager = {
       accounts: { list: async () => structuredClone(accounts), detectAll: async () => structuredClone(accounts), detectLogin: async () => accounts[0], open: async () => {}, create: async () => accounts[0],
-        update: async (input: any) => Object.assign(accounts.find(a => a.id === input.id)!, input), resetQuota: async () => accounts[0], resetAllQuotas: async () => accounts, relogin: async () => true, delete: async () => true },
+        update: async (input: any) => { const account = accounts.find(a => a.id === input.id)!; Object.assign(account, input); account.availableQuota = account.dailyQuotaExhausted ? 0 : account.quotaRemaining; return account; }, resetQuota: async () => accounts[0], resetAllQuotas: async () => accounts, relogin: async () => true, delete: async () => true },
       settings: { get: async () => ({ ...settings }), update: async (input: any) => { settings = { ...settings, ...input }; fixture.saved++; return { ...settings }; } },
-      apiServer: { status: async () => ({ version: '0.1.75', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
+      apiServer: { status: async () => ({ version: '0.1.76', enabled: true, running: true, port: 17888, url: 'http://127.0.0.1:17888', message: '运行中' }), restart: async () => { fixture.restarts++; } },
       watermark: { status: async () => ({ configured: true, usage: unknown ? null : { remainingCount: depleted ? 0 : 468, usedCount: depleted ? 1000 : 532, totalLimit: 1000 },
         checkedAt: unknown ? null : now, usageUpdatedAt: unknown ? null : now, error: depleted ? requests[1].error : null }) },
       apiRequests: { list: async () => structuredClone(requests), todaySuccessCount: async () => 8, stats: async () => ({ todaySuccess: 8, todayFailed: 2, running: 1, queued: 0 }), clear: async () => true,
@@ -148,4 +148,27 @@ test('shows provider-exhausted accounts unavailable without falsifying local spe
   await expect(page.locator('.logs-table tbody tr')).toContainText('豆包今日免费次数已用完');
   await page.getByRole('button', { name: '详情', exact: true }).click();
   await expect(page.getByRole('dialog')).toContainText('今日视频生成免费次数用完了');
+});
+
+test('saves decimal costs and account consumption without rounding them to integers', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '配置管理' }).click();
+  const fast = page.getByLabel('Fast 单次消耗');
+  await expect(fast).toHaveAttribute('step', '0.1');
+  await fast.fill('3.5');
+  expect(await fast.evaluate((el: HTMLInputElement) => el.checkValidity())).toBe(true);
+  await page.getByRole('button', { name: '保存配置' }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__fixture.settings().fastCost)).toBe(3.5);
+  await page.getByRole('button', { name: '账号池', exact: true }).click();
+  await expect(page.locator('.capacity')).toHaveText('Mini 13 次/Fast 5 次');
+  await page.getByRole('button', { name: '更多账号操作' }).first().click();
+  await page.getByRole('button', { name: '账号设置', exact: true }).click();
+  await page.getByLabel('今日已消耗额度').fill('3.5');
+  await expect(page.locator('.readonly-quota')).toContainText('6.5');
+  await page.getByRole('button', { name: '保存设置', exact: true }).click();
+  await expect(page.locator('.accounts-table tbody tr').first()).toContainText('已用 3.5');
+  expect(await page.evaluate(() => (window as any).__fixture.accounts[0].quotaRemaining)).toBe(6.5);
+  await expect(page.locator('.balance-row').first().locator('.balance-value')).toContainText('23.5');
+  await expect(page.locator('.capacity')).toHaveText('Mini 11 次/Fast 4 次');
+  await page.screenshot({ path: 'test-results/decimal-quota-desktop.png', fullPage: true });
 });

@@ -1,7 +1,7 @@
 import type { AppSettings } from "./types.js";
 import type { RequestErrorInfo } from "./types.js";
-import { classifyWatermarkFailure } from "./request-diagnostics.js";
-import { extractWatermarkUsage, type WatermarkProviderObserver } from "./watermark-state.js";
+import { classifyWatermarkFailure, requestError } from "./request-diagnostics.js";
+import { extractWatermarkUsage, watermarkScope, type WatermarkProviderObserver } from "./watermark-state.js";
 
 export class WatermarkError extends Error {
   constructor(readonly info: RequestErrorInfo, message = `${info.title}：${info.detail}`) {
@@ -34,6 +34,7 @@ export interface WatermarkRetryInfo {
   delayMs: number;
   error: string;
   elapsedMs: number;
+  configurationChanged?: boolean;
 }
 
 type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>;
@@ -41,6 +42,7 @@ type WatermarkRetryCallback = (info: WatermarkRetryInfo) => void | Promise<void>
 export interface WatermarkResolveOptions {
   maxAttempts?: number;
   onProviderResponse?: WatermarkProviderObserver;
+  getSettings?: () => AppSettings;
 }
 
 export function getWatermarkRetryDelays(
@@ -96,29 +98,36 @@ export async function resolveCleanVideoUrl(
   onRetry?: WatermarkRetryCallback,
   options: WatermarkResolveOptions = {}
 ) {
-  if (!settings.watermarkApiToken.trim()) {
-    throw new WatermarkError(classifyWatermarkFailure("未配置去水印 Token，无法返回可用视频"));
-  }
-
   let lastError: unknown;
+  let nextDelayMs = 0;
   const startedAt = Date.now();
   const retryDelays = getWatermarkRetryDelays(options.maxAttempts);
   for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
-    const delayMs = retryDelays[attempt];
-    if (delayMs) await wait(delayMs);
+    if (nextDelayMs) await wait(nextDelayMs);
+    const activeSettings = { ...(options.getSettings?.() || settings) };
 
     try {
-      return await resolveCleanVideoUrlOnce(settings, shareUrl, options.onProviderResponse);
+      if (!activeSettings.watermarkApiToken.trim()) {
+        throw new WatermarkError(classifyWatermarkFailure("未配置去水印 Token，无法返回可用视频"));
+      }
+      return await resolveCleanVideoUrlOnce(activeSettings, shareUrl, options.onProviderResponse);
     } catch (error) {
       lastError = error;
-      if (!isRetryableWatermarkError(error) || attempt === retryDelays.length - 1) {
+      const configurationChanged = watermarkScope(activeSettings) !== watermarkScope(options.getSettings?.() || settings);
+      if (configurationChanged && attempt === retryDelays.length - 1) {
+        throw new WatermarkError(requestError("watermark", "configuration_changed", "去水印配置已更换",
+          "旧配置请求未成功，本次已到重试上限。", "使用已保存的新配置恢复结果，无需重新生成视频。", true));
+      }
+      if ((!configurationChanged && !isRetryableWatermarkError(error)) || attempt === retryDelays.length - 1) {
         throw error;
       }
+      nextDelayMs = configurationChanged ? 0 : retryDelays[attempt + 1];
       await onRetry?.({
         failedAttempt: attempt + 1,
         nextAttempt: attempt + 2,
         maxAttempts: retryDelays.length,
-        delayMs: retryDelays[attempt + 1],
+        delayMs: nextDelayMs,
+        configurationChanged,
         error: errorMessage(error),
         elapsedMs: Date.now() - startedAt
       });

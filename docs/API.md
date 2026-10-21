@@ -3,7 +3,7 @@
 ## 基础信息
 
 - 默认地址：`http://127.0.0.1:17888`
-- 当前接口版本：`0.1.75`
+- 当前接口版本：`0.1.76`
 - 默认认证：`Authorization: Bearer local-doubao-key`
 - 除 `/health` 外，其余接口均需要 Bearer Token。
 - 建议在“配置管理”中修改默认 API Key。
@@ -24,6 +24,8 @@ Authorization: Bearer <api-key>
 账号记录增加 `quotaDate`（北京时间账期）、`nextQuotaResetAt`（下一次零点的 UTC ISO 时间）、`runningTaskCount`、`queuedTaskCount` 和 `maxConcurrentTasks`；原字段保持兼容。单个账号默认最多 3 条任务同时准备和发送，总任务并发上限默认 5，已有配置值不改写。
 
 0.1.75 新增 `dailyQuotaExhausted`、`quotaExhaustedDate`、`quotaExhaustedReason` 和 `availableQuota`。豆包确认今日免费次数用完时，`availableQuota` 为 0，但 `quotaRemaining`、`quotaUsedToday` 仍保留真实本地账本，不伪造消费。退款、刷新、登录检测和重启不会清除当天标记；北京时间次日零点解除，不重置付费去水印次数。
+
+0.1.76 的 Mini/Fast 本地单次消耗支持一位小数，最小仍为 1 点；余额、已用和任务扣点可能为小数。总每日额度仍为整数，原 API 字段及状态不变。每个任务保留预扣时的价格，换号和退款按该价格处理；可生成次数按每个账号可用点数向下取整，不能四舍五入成可生成任务。本地设置不是豆包官方计费承诺。
 
 ## 提交视频生成
 
@@ -128,6 +130,8 @@ Authorization: Bearer <api-key>
 正在执行或排队的任务不能重复恢复。已记录准确源对话的任务固定在自己的对话中找结果，不按重复标题或相同提示词取其他任务的视频；源对话和内部分享地址分别保存，公开成功结果仍只包含已验证的 MP4。
 
 ## 单独解析视频结果
+
+保存去水印地址或 Token 后，后续解析尝试读取最新配置，包括已经处于生成等待中的任务、结果恢复和独立解析，无需重启本地服务。已经发出的上游请求不会被撤回；有效 MP4 成功结果不因换配置而重复解析。失败时若发现配置已更新，在有限重试内切换；上限用完则返回 `watermark / configuration_changed`，可恢复已有结果，不重新生成视频。已结束的失败任务不会因保存配置而自动重跑。此机制不改变去水印协议，不代表任意第三方接口都兼容。
 
 ### 查询最近的去水印用量
 

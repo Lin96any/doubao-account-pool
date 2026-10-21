@@ -712,9 +712,11 @@ export class DoubaoExecutor {
             requestId,
             assignmentRevision,
             status: "running",
-            message: `去水印第 ${retry.failedAttempt} 次未拿到可播放 MP4，已耗时 ${elapsedSeconds} 秒；${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
+            message: retry.configurationChanged
+              ? "检测到去水印配置已更新，正在使用已保存的新配置重新解析现有视频"
+              : `去水印第 ${retry.failedAttempt} 次未拿到可播放 MP4，已耗时 ${elapsedSeconds} 秒；${delaySeconds} 秒后进行第 ${retry.nextAttempt}/${retry.maxAttempts} 次解析：${retry.error}`
           });
-        }, { maxAttempts, onProviderResponse: this.onWatermarkResponse });
+        }, { maxAttempts, onProviderResponse: this.onWatermarkResponse, getSettings: () => this.database.getSettings() });
         return { url, elapsedMs: Date.now() - startedAt, retryCount };
       } catch (error) {
         const elapsedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1000));

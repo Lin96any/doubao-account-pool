@@ -291,7 +291,7 @@ class LocalApiServer {
           return;
         }
         try {
-          const cleanVideoUrl = await resolveCleanVideoUrl(settings, sourceUrl, undefined, { onProviderResponse: observeWatermarkResponse });
+          const cleanVideoUrl = await resolveCleanVideoUrl(settings, sourceUrl, undefined, { onProviderResponse: observeWatermarkResponse, getSettings: () => this.database.getSettings() });
           recordOperation(null, null, "独立去水印解析", "success", "已验证真实 MP4 地址", sourceUrl);
           sendJson(response, 200, {
             status: "success",
@@ -468,7 +468,8 @@ function registerIpc() {
     if (previous.apiPort !== settings.apiPort || previous.apiServiceEnabled !== settings.apiServiceEnabled || previous.apiKey !== settings.apiKey) {
       await apiServer.applySettings(settings);
     }
-    recordOperation(null, null, "保存配置", "success", "配置已保存并应用");
+    const watermarkChanged = previous.watermarkApiUrl !== settings.watermarkApiUrl || previous.watermarkApiToken !== settings.watermarkApiToken;
+    recordOperation(null, null, "保存配置", "success", watermarkChanged ? "去水印配置已保存，后续解析尝试使用新配置；已发出的请求不撤回，已失败任务可恢复结果" : "配置已保存并应用");
     return settings;
   });
 
